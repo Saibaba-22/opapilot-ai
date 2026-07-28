@@ -1,0 +1,107 @@
+name: AI Agent - RCA on CI/CD Failure
+
+on:
+  workflow_run:
+    workflows: ["Build and Deploy AI DevOps Assistant"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: Failed GitHub Actions run ID to analyze
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+  issues: write
+
+concurrency:
+  group: ai-agent-rca-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  rca:
+    name: Analyze failed run and create RCA artifact
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'failure'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install AI agent dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install google-generativeai==0.8.3
+
+      - name: Resolve failed run ID
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "RUN_ID=${{ inputs.run_id }}" >> "$GITHUB_ENV"
+          else
+            echo "RUN_ID=${{ github.event.workflow_run.id }}" >> "$GITHUB_ENV"
+          fi
+
+      - name: Collect workflow metadata and logs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p ai-agent-input
+          gh run view "$RUN_ID" --repo "$GITHUB_REPOSITORY" \
+            --json databaseId,displayTitle,event,headBranch,headSha,status,conclusion,createdAt,updatedAt,url,workflowName,jobs \
+            > ai-agent-input/run.json
+          gh run view "$RUN_ID" --repo "$GITHUB_REPOSITORY" --log \
+            > ai-agent-input/combined.log || true
+
+      - name: Generate RCA artifact
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          AI_AGENT_API_KEY: ${{ secrets.AI_AGENT_API_KEY }}
+          AI_AGENT_MODEL: ${{ vars.AI_AGENT_MODEL }}
+          RUN_ID: ${{ env.RUN_ID }}
+        run: |
+          set -euo pipefail
+          python scripts/ai_ci_agent.py analyze \
+            --run-id "$RUN_ID" \
+            --metadata-file ai-agent-input/run.json \
+            --logs-file ai-agent-input/combined.log \
+            --output-dir ai-agent-output
+
+      - name: Upload RCA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-agent-rca-run-${{ env.RUN_ID }}
+          path: ai-agent-output/
+          retention-days: 30
+
+      - name: Ensure labels exist
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh label create ai-agent --color 5319E7 --description "Created by AI CI/CD remediation agent" || true
+          gh label create needs-human-approval --color FBCA04 --description "Requires maintainer approval" || true
+          gh label create ci-failure --color D73A4A --description "CI/CD pipeline failure" || true
+
+      - name: Create RCA issue for human approval
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ISSUE_URL=$(gh issue create \
+            --title "AI RCA: CI/CD failure in run $RUN_ID" \
+            --body-file ai-agent-output/issue.md \
+            --label ai-agent \
+            --label needs-human-approval \
+            --label ci-failure)
+          echo "Created RCA issue: $ISSUE_URL"

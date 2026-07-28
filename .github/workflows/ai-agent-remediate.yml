@@ -1,0 +1,226 @@
+name: AI Agent - Human Approved Remediation
+
+on:
+  issue_comment:
+    types: [created]
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: RCA issue number to remediate
+        required: true
+        type: string
+      run_id:
+        description: Optional failed run ID to fetch logs again
+        required: false
+        type: string
+
+permissions:
+  actions: read
+  contents: write
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: ai-agent-remediate-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  remediate:
+    name: Create AI remediation pull request
+    if: github.event_name == 'workflow_dispatch' || (github.event.issue.pull_request == null && contains(github.event.comment.body, '/ai-agent approve'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Authorize approval command
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          AUTHOR_ASSOCIATION: ${{ github.event.comment.author_association }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "issue_comment" ]; then
+            case "$AUTHOR_ASSOCIATION" in
+              OWNER|MEMBER|COLLABORATOR)
+                echo "Approval command authorized for $AUTHOR_ASSOCIATION"
+                ;;
+              *)
+                echo "Only OWNER, MEMBER, or COLLABORATOR comments may approve AI remediation. Current association: $AUTHOR_ASSOCIATION"
+                exit 1
+                ;;
+            esac
+            if ! printf '%s' "$COMMENT_BODY" | grep -q '/ai-agent approve'; then
+              echo "No approval command found"
+              exit 1
+            fi
+          fi
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install google-generativeai==0.8.3
+          python -m pip install -r requirements-dev.txt
+
+      - name: Resolve issue and run context
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p ai-agent-input
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            ISSUE_NUMBER="${{ inputs.issue_number }}"
+            RUN_ID="${{ inputs.run_id }}"
+          else
+            ISSUE_NUMBER="${{ github.event.issue.number }}"
+            RUN_ID=""
+          fi
+
+          gh issue view "$ISSUE_NUMBER" --json title,body,url,labels > ai-agent-input/issue.json
+          python - <<'PY'
+          import json
+          data = json.load(open('ai-agent-input/issue.json', encoding='utf-8'))
+          with open('ai-agent-input/issue.md', 'w', encoding='utf-8') as f:
+              f.write('# ' + data.get('title', 'AI RCA issue') + '\n\n')
+              f.write(data.get('body') or '')
+              f.write('\n')
+          PY
+
+          if [ -z "$RUN_ID" ]; then
+            RUN_ID=$(grep -Eo 'Run ID: [0-9]+' ai-agent-input/issue.md | awk '{print $3}' | head -1 || true)
+          fi
+
+          echo "ISSUE_NUMBER=$ISSUE_NUMBER" >> "$GITHUB_ENV"
+          echo "RUN_ID=$RUN_ID" >> "$GITHUB_ENV"
+
+          if [ -n "$RUN_ID" ]; then
+            gh run view "$RUN_ID" --repo "$GITHUB_REPOSITORY" --log > ai-agent-input/combined.log || true
+          else
+            echo "No run ID found in issue; remediation will use issue RCA and repository context only." > ai-agent-input/combined.log
+          fi
+
+      - name: Apply approved AI remediation
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          AI_AGENT_API_KEY: ${{ secrets.AI_AGENT_API_KEY }}
+          AI_AGENT_MODEL: ${{ vars.AI_AGENT_MODEL }}
+        run: |
+          set -euo pipefail
+          python scripts/ai_ci_agent.py remediate \
+            --issue-body ai-agent-input/issue.md \
+            --logs-file ai-agent-input/combined.log \
+            --output-dir ai-agent-output
+
+      - name: Validate Python files
+        run: |
+          set -euo pipefail
+          python -m py_compile app.py scripts/ai_ci_agent.py
+
+      - name: Run pytest after remediation
+        run: |
+          set -euo pipefail
+          pytest -q
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image after remediation
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          push: false
+          tags: local/devops-ai-assistant:ai-agent-${{ github.run_id }}
+
+      - name: Smoke test remediated container
+        run: |
+          set -euo pipefail
+          docker run -d \
+            -p 5000:5000 \
+            -e GEMINI_API_KEY=dummy-for-healthcheck \
+            --name ai-assistant-ai-agent-ci \
+            local/devops-ai-assistant:ai-agent-${{ github.run_id }}
+
+          cleanup() {
+            docker logs ai-assistant-ai-agent-ci || true
+            docker rm -f ai-assistant-ai-agent-ci || true
+          }
+          trap cleanup EXIT
+
+          for i in {1..10}; do
+            if curl -fsS http://localhost:5000/health; then
+              echo "Container health check passed"
+              exit 0
+            fi
+            sleep 2
+          done
+
+          echo "Container health check failed"
+          exit 1
+
+      - name: Upload remediation artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-agent-remediation-${{ env.ISSUE_NUMBER }}-${{ github.run_id }}
+          path: ai-agent-output/
+          retention-days: 30
+
+      - name: Create pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$(git status --porcelain)" ]; then
+            gh issue comment "$ISSUE_NUMBER" --body "AI remediation was approved, but no safe repository code change was produced. Please review the RCA manual actions."
+            exit 0
+          fi
+
+          BRANCH="ai-agent/remediate-issue-${ISSUE_NUMBER}-${GITHUB_RUN_ID}"
+          git config user.name "ai-agent[bot]"
+          git config user.email "ai-agent[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          git add -A
+          git commit -m "AI agent remediation for issue #$ISSUE_NUMBER"
+          git push origin "$BRANCH"
+
+          cat > ai-agent-output/pr-body.md <<EOF
+          ## AI Agent Remediation
+
+          This pull request was created only after a human approved the RCA issue with `/ai-agent approve`.
+
+          - RCA issue: #$ISSUE_NUMBER
+          - Failed run ID: ${RUN_ID:-not available}
+          - Remediation artifact: ai-agent-remediation-${ISSUE_NUMBER}-${GITHUB_RUN_ID}
+
+          ### Safety gates
+
+          - Python syntax validation completed in this workflow.
+          - Pytest completed in this workflow.
+          - Docker image build completed in this workflow.
+          - Container `/health` smoke test completed in this workflow.
+          - This PR must be reviewed and merged by a human.
+          - After merge to `main`, Docker publishing requires the `docker-publish` environment approval.
+          - Production deployment requires the `production` environment approval.
+          EOF
+
+          PR_URL=$(gh pr create \
+            --title "AI remediation for CI/CD failure #$ISSUE_NUMBER" \
+            --body-file ai-agent-output/pr-body.md \
+            --base main \
+            --head "$BRANCH")
+
+          gh issue comment "$ISSUE_NUMBER" --body "AI remediation pull request created: $PR_URL"
+          echo "Created PR: $PR_URL"
