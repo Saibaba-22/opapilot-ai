@@ -13,8 +13,8 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  IMAGE_NAME: devops-ai-assistant
-  CONTAINER_NAME: ai-assistant
+  IMAGE_NAME: opspilotai
+  CONTAINER_NAME: opspilot
 
 jobs:
   validate:
