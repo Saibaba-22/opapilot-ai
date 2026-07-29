@@ -20,7 +20,7 @@ This project now has a human-approved AI remediation loop for GitHub Actions, Do
    /ai-agent approve
    ```
 
-6. `AI Agent - Human Approved Remediation` then creates a branch, applies only allow-listed CI/CD/Docker/app changes, validates Python and Docker, and opens a pull request.
+6. `AI Agent - Human Approved Remediation` then runs the v3 remediation loop: it applies only allow-listed CI/CD/Docker/app/test changes, validates Python compile, pytest, Docker build, and container `/health`, retries with validation feedback when needed, and opens a pull request only after validation passes.
 7. A human reviews and merges the pull request.
 8. After merge to `main`, Docker publish and production deploy are still gated by GitHub Environment approvals.
 
@@ -130,6 +130,26 @@ If the issue comment trigger is not desired:
 - `/health` endpoint smoke test.
 
 The `docker-publish` job depends on both `validate` and `pytest`, so Docker publishing and EC2 deployment cannot start unless pytest passes.
+
+## Enhanced AI Remediation v3
+
+The human-approved remediation workflow now has a validation retry loop. After `/ai-agent approve`, it can safely remediate allow-listed issues in `app.py`, `.github/workflows/deploy.yml`, Dockerfile, requirements, and tests.
+
+The v3 workflow validates every remediation attempt with:
+
+- `python -m py_compile app.py scripts/ai_ci_agent.py`
+- `pytest -q`
+- `docker build`
+- a running container `/health` smoke test on port `5000`
+
+If validation fails, the validation output is fed into the next remediation attempt. The default maximum is 3 attempts and can be configured with the repository variable `AI_AGENT_MAX_ATTEMPTS`.
+
+Known deterministic safe remediations include:
+
+- removing the exact intentional training failure file `tests/test_training_failure.py` when it contains `Training pytest failure for AI RCA demo` and `assert False`;
+- restoring the project standard port `5000` in `deploy.yml`, Dockerfile, and `app.py` when a demo mistake changes it to `500`.
+
+The agent still will not fix secrets or infrastructure directly. For expired Docker tokens, wrong EC2 SSH keys, blocked security groups, quota/rate-limit problems, or unavailable cloud resources, it creates artifacts explaining the required manual action.
 
 ## Rollback
 

@@ -29,7 +29,7 @@ jobs:
     name: Create AI remediation pull request
     if: github.event_name == 'workflow_dispatch' || (github.event.issue.pull_request == null && contains(github.event.comment.body, '/ai-agent approve'))
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 35
 
     steps:
       - name: Authorize approval command
@@ -65,6 +65,9 @@ jobs:
         with:
           python-version: '3.11'
           cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
 
       - name: Install dependencies
         run: |
@@ -111,66 +114,22 @@ jobs:
             echo "No run ID found in issue; remediation will use issue RCA and repository context only." > ai-agent-input/combined.log
           fi
 
-      - name: Apply approved AI remediation
+      - name: Run approved AI remediation v3 with validation retry loop
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           AI_AGENT_API_KEY: ${{ secrets.AI_AGENT_API_KEY }}
           AI_AGENT_MODEL: ${{ vars.AI_AGENT_MODEL }}
+          AI_AGENT_MAX_ATTEMPTS: ${{ vars.AI_AGENT_MAX_ATTEMPTS }}
         run: |
           set -euo pipefail
           python scripts/ai_ci_agent.py remediate \
             --issue-body ai-agent-input/issue.md \
             --logs-file ai-agent-input/combined.log \
-            --output-dir ai-agent-output
-
-      - name: Validate Python files
-        run: |
-          set -euo pipefail
-          python -m py_compile app.py scripts/ai_ci_agent.py
-
-      - name: Run pytest after remediation
-        run: |
-          set -euo pipefail
-          pytest -q
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Build Docker image after remediation
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          load: true
-          push: false
-          tags: local/devops-ai-assistant:ai-agent-${{ github.run_id }}
-
-      - name: Smoke test remediated container
-        run: |
-          set -euo pipefail
-          docker run -d \
-            -p 5000:5000 \
-            -e GEMINI_API_KEY=dummy-for-healthcheck \
-            --name ai-assistant-ai-agent-ci \
-            local/devops-ai-assistant:ai-agent-${{ github.run_id }}
-
-          cleanup() {
-            docker logs ai-assistant-ai-agent-ci || true
-            docker rm -f ai-assistant-ai-agent-ci || true
-          }
-          trap cleanup EXIT
-
-          for i in {1..10}; do
-            if curl -fsS http://localhost:5000/health; then
-              echo "Container health check passed"
-              exit 0
-            fi
-            sleep 2
-          done
-
-          echo "Container health check failed"
-          exit 1
+            --output-dir ai-agent-output \
+            --max-attempts "${AI_AGENT_MAX_ATTEMPTS:-3}"
 
       - name: Upload remediation artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: ai-agent-remediation-${{ env.ISSUE_NUMBER }}-${{ github.run_id }}
@@ -183,21 +142,47 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [ -z "$(git status --porcelain)" ]; then
-            gh issue comment "$ISSUE_NUMBER" --body "AI remediation was approved, but no safe repository code change was produced. Please review the RCA manual actions."
-            exit 0
-          fi
+          # Do not include transient RCA/remediation artifacts in the remediation PR.
+          git restore -- ai-agent-input ai-agent-output || true
 
           BRANCH="ai-agent/remediate-issue-${ISSUE_NUMBER}-${GITHUB_RUN_ID}"
           git config user.name "ai-agent[bot]"
           git config user.email "ai-agent[bot]@users.noreply.github.com"
           git checkout -b "$BRANCH"
-          git add -A
+
+          ALLOWED_PATHS=(
+            ".github/workflows/deploy.yml"
+            ".github/workflows/ai-agent-rca.yml"
+            ".github/workflows/ai-agent-remediate.yml"
+            "Dockerfile"
+            ".dockerignore"
+            ".gitignore"
+            "requirements.txt"
+            "requirements-dev.txt"
+            "app.py"
+            "tests/test_app.py"
+            "tests/test_training_failure.py"
+            "README.md"
+            "docs/AI_AGENT_RUNBOOK.md"
+            "scripts/ai_ci_agent.py"
+          )
+
+          for path in "${ALLOWED_PATHS[@]}"; do
+            if [ -e "$path" ] || git ls-files --error-unmatch "$path" >/dev/null 2>&1; then
+              git add "$path" || true
+            fi
+          done
+
+          if git diff --cached --quiet; then
+            gh issue comment "$ISSUE_NUMBER" --body "AI remediation was approved and validation ran, but no safe repository code change was produced. Please review the RCA and remediation artifacts for manual actions."
+            exit 0
+          fi
+
           git commit -m "AI agent remediation for issue #$ISSUE_NUMBER"
           git push origin "$BRANCH"
 
           cat > ai-agent-output/pr-body.md <<EOF
-          ## AI Agent Remediation
+          ## AI Agent Remediation v3
 
           This pull request was created only after a human approved the RCA issue with `/ai-agent approve`.
 
@@ -205,12 +190,16 @@ jobs:
           - Failed run ID: ${RUN_ID:-not available}
           - Remediation artifact: ai-agent-remediation-${ISSUE_NUMBER}-${GITHUB_RUN_ID}
 
+          ### What v3 validates before PR creation
+
+          - Python syntax validation
+          - Pytest
+          - Docker image build
+          - Container `/health` smoke test on port 5000
+          - Up to three remediation attempts by default when validation fails
+
           ### Safety gates
 
-          - Python syntax validation completed in this workflow.
-          - Pytest completed in this workflow.
-          - Docker image build completed in this workflow.
-          - Container `/health` smoke test completed in this workflow.
           - This PR must be reviewed and merged by a human.
           - After merge to `main`, Docker publishing requires the `docker-publish` environment approval.
           - Production deployment requires the `production` environment approval.
@@ -224,3 +213,29 @@ jobs:
 
           gh issue comment "$ISSUE_NUMBER" --body "AI remediation pull request created: $PR_URL"
           echo "Created PR: $PR_URL"
+
+      - name: Comment remediation failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set +e
+          if [ -z "${ISSUE_NUMBER:-}" ]; then
+            echo "ISSUE_NUMBER not available; cannot comment on issue."
+            exit 0
+          fi
+
+          {
+            echo "AI remediation v3 failed after the approved remediation attempt."
+            echo
+            echo "Please review the workflow logs and the uploaded artifact named:"
+            echo
+            echo "ai-agent-remediation-${ISSUE_NUMBER}-${GITHUB_RUN_ID}"
+            echo
+            if [ -f ai-agent-output/remediation-plan.md ]; then
+              echo "## Remediation plan summary"
+              head -c 6000 ai-agent-output/remediation-plan.md
+            fi
+          } > ai-agent-output/failure-comment.md
+
+          gh issue comment "$ISSUE_NUMBER" --body-file ai-agent-output/failure-comment.md || true

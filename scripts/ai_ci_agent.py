@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
-"""AI CI/CD remediation assistant for GitHub Actions and Docker.
+"""AI CI/CD remediation assistant for GitHub Actions, pytest, Docker, and deploy YAML.
 
-This script has two modes:
+Modes:
 
 1. analyze   - summarize a failed GitHub Actions run and produce an RCA artifact.
-2. remediate - after human approval, propose and apply a minimal patch on a branch.
+2. remediate - after human approval, apply a constrained remediation with a
+   validation/retry loop and produce a pull-request-ready worktree.
 
-The script is intentionally constrained:
-- It reads only repository files needed for CI/CD and Docker diagnosis.
-- It writes only allow-listed files during remediation.
-- It creates artifacts/PR content; it never merges to main or deploys production by itself.
+Safety design:
+- The agent only edits allow-listed files.
+- It never merges to main.
+- It never deploys production.
+- It validates before a PR is created.
+- It returns manual actions when a failure is outside repository code control
+  such as expired secrets, broken EC2 access, or cloud/network configuration.
 """
 
 from __future__ import annotations
@@ -20,14 +24,20 @@ import json
 import os
 import pathlib
 import re
+import shutil
+import subprocess
 import sys
 import textwrap
+import time
+import urllib.request
 from typing import Iterable
 
 ROOT_DEFAULT = pathlib.Path.cwd()
 MAX_LOG_CHARS = 60_000
 MAX_FILE_CHARS = 18_000
 MAX_PROMPT_CHARS = 95_000
+PROJECT_PORT = "5000"
+DEFAULT_MAX_ATTEMPTS = 3
 
 
 def now_utc() -> str:
@@ -71,6 +81,12 @@ SECRET_PATTERNS = [
     (re.compile(r"AKIA[0-9A-Z]{16}"), "***MASKED_AWS_ACCESS_KEY***"),
     (re.compile(r"(?i)gh[pousr]_[A-Za-z0-9_]{20,}"), "***MASKED_GITHUB_TOKEN***"),
 ]
+
+MANUAL_ONLY_HINTS = (
+    "docker login", "unauthorized", "denied: requested access", "authentication required",
+    "permission denied (publickey)", "host key verification failed", "connection timed out",
+    "no space left on device", "quota", "rate limit", "secret", "secrets.",
+)
 
 
 def sanitize(text: str) -> str:
@@ -125,7 +141,6 @@ def truncate_prompt(*parts: str) -> str:
     prompt = "\n\n".join(parts)
     if len(prompt) <= MAX_PROMPT_CHARS:
         return prompt
-    # Preserve the end of logs because failures usually appear near the end.
     return prompt[:35_000] + "\n\n...[middle prompt truncated]...\n\n" + prompt[-55_000:]
 
 
@@ -156,12 +171,12 @@ def fallback_analysis(run_id: str, logs: str, context: str) -> str:
             "Docker Hub authentication failed. Check DOCKERHUB_USERNAME and DOCKERHUB_TOKEN secrets, "
             "token permissions, and Docker Hub rate/auth restrictions."
         )
-    if "docker build" in lower or "buildx" in lower:
-        likely.append("Docker build/buildx failure. Review Dockerfile, requirements install output, and image build context.")
     if "pytest" in lower or "assertionerror" in lower:
         likely.append("Pytest failure. Review the failing test name, assertion, and related app/test code.")
+    if "docker build" in lower or "buildx" in lower:
+        likely.append("Docker build/buildx failure. Review Dockerfile, requirements install output, and image build context.")
     if "curl" in lower and "/health" in lower:
-        likely.append("Post-deploy health check failed. Container may not have started, app may be unhealthy, or port/security-group may be wrong.")
+        likely.append("Health check failed. Check app route, app/container port 5000, Docker port mapping, and deployment script.")
     if "permission denied" in lower and ("ssh" in lower or "ec2" in lower):
         likely.append("EC2 SSH deployment failed. Check EC2_SSH_KEY, username, host, and instance SSH access.")
     if not likely:
@@ -174,7 +189,7 @@ Run ID: {run_id}
 
 ## Executive summary
 
-The AI provider was not available, so this is a deterministic fallback RCA. The failed run logs were still collected and inspected for common CI/CD and Docker failure patterns.
+The AI provider was not available, so this is a deterministic fallback RCA. The failed run logs were still collected and inspected for common CI/CD, pytest, Docker, and deployment failure patterns.
 
 ## Most likely root cause
 
@@ -182,18 +197,18 @@ The AI provider was not available, so this is a deterministic fallback RCA. The 
 
 ## Recommended solution options
 
-1. Fix missing or invalid GitHub Actions secrets and rerun the failed workflow.
-2. Split CI/CD into validate, pytest, Docker publish, and deploy jobs so test failures block deployment.
-3. Add or use an AI RCA workflow that creates this artifact automatically on pipeline failure.
-4. Add or use a human-approved remediation workflow that opens a pull request instead of pushing directly to `main`.
+1. Fix missing or invalid GitHub Actions secrets if the failure is secret/infrastructure related.
+2. Fix repository files if the failure is in `app.py`, tests, Dockerfile, requirements, or workflow YAML.
+3. Keep validate and pytest as pre-deployment gates.
+4. Use the human-approved remediation workflow to prepare a PR instead of pushing directly to `main`.
 
 ## Validation plan
 
-- Run Python syntax/dependency checks.
-- Run pytest before Docker publishing and deployment.
-- Build the Docker image locally in GitHub Actions before publishing.
-- Start the container in CI and call `/health`.
-- After merge, approve the `docker-publish` environment, then approve the `production` environment.
+- Run Python syntax checks.
+- Run pytest.
+- Build the Docker image.
+- Start the container and call `/health` on port 5000.
+- After merge, approve `docker-publish`, then approve `production`.
 
 ## Rollback plan
 
@@ -202,7 +217,7 @@ The AI provider was not available, so this is a deterministic fallback RCA. The 
 
 ## Human approval
 
-Comment `/ai-agent approve` on the generated RCA issue to allow the remediation workflow to create a pull request. Review and merge the PR manually. Production deploy remains gated by GitHub Environment approvals.
+Comment `/ai-agent approve` on the generated RCA issue to allow the remediation workflow to create a pull request. Review and merge the PR manually.
 """
 
 
@@ -211,7 +226,7 @@ def build_analysis_prompt(run_id: str, repo: str, metadata: str, logs: str, cont
         f"Repository: {repo}\nFailed workflow run ID: {run_id}\nCurrent UTC time: {now_utc()}",
         "Workflow metadata:\n```json\n" + metadata + "\n```",
         "Failed logs:\n```\n" + logs + "\n```",
-        "Repository CI/CD and Docker context:\n" + context,
+        "Repository CI/CD, pytest, Docker, and app context:\n" + context,
         textwrap.dedent(
             """
             Create a production-ready RCA artifact in Markdown.
@@ -248,8 +263,8 @@ def analyze(args: argparse.Namespace) -> int:
     run_id = args.run_id or os.environ.get("RUN_ID", "unknown")
 
     system_instruction = (
-        "You are a senior DevOps incident responder. Analyze GitHub Actions, Docker, "
-        "pytest, and deployment failures. Produce RCA and remediation plans only; never suggest "
+        "You are a senior DevOps incident responder. Analyze GitHub Actions, pytest, Docker, "
+        "app.py, YAML, and deployment failures. Produce RCA and remediation plans only; never suggest "
         "direct production changes without human approval."
     )
     prompt = build_analysis_prompt(run_id, repo, metadata, logs, context)
@@ -286,11 +301,12 @@ If you approve the agent to prepare a fix, comment exactly:
 The remediation workflow will then:
 
 1. create a new branch,
-2. apply an allow-listed CI/CD/Docker/test remediation only,
-3. run Python, pytest, and Docker validation,
-4. open a pull request for human review.
+2. apply an allow-listed app/CI/CD/Docker/test remediation only,
+3. run Python, pytest, Docker build, and container `/health` validation,
+4. retry remediation up to the configured limit if validation fails,
+5. open a pull request for human review if validation passes.
 
-It will **not** merge the pull request and will **not** deploy production automatically. Docker publishing and production deployment are gated by GitHub Environments.
+It will **not** merge the pull request and will **not** deploy production automatically.
 """
     (output_dir / "issue.md").write_text(issue_body, encoding="utf-8")
     (output_dir / "logs-sanitized.txt").write_text(logs, encoding="utf-8")
@@ -323,14 +339,16 @@ def validate_path(path: str) -> str:
     return normalized
 
 
-def build_remediation_prompt(issue_body: str, logs: str, context: str) -> str:
+def build_remediation_prompt(issue_body: str, logs: str, context: str, attempt: int, validation_feedback: str) -> str:
     return truncate_prompt(
+        f"Remediation attempt: {attempt}",
         "Human-approved RCA issue body:\n" + issue_body,
-        "Available sanitized failed-run logs:\n```\n" + logs + "\n```",
-        "Current repository files:\n" + context,
+        "Original sanitized failed-run logs:\n```\n" + logs + "\n```",
+        "Validation feedback from previous remediation attempt, if any:\n```\n" + (validation_feedback or "No previous validation feedback.") + "\n```",
+        "Current repository files after any prior remediation attempts:\n" + context,
         textwrap.dedent(
             f"""
-            A repository maintainer approved remediation. Propose a minimal safe patch.
+            A repository maintainer approved remediation. Propose a minimal safe patch for this repo.
 
             Return STRICT JSON only, no Markdown fences, in this shape:
             {{
@@ -345,14 +363,25 @@ def build_remediation_prompt(issue_body: str, logs: str, context: str) -> str:
             Constraints:
             - You may edit only these files: {', '.join(ALLOWED_REMEDIATION_PATHS)}.
             - Use action="write" when replacing/creating a file and include complete replacement content.
-            - Use action="delete" only for allow-listed files that are clearly the root cause.
-            - If pytest fails because tests/test_training_failure.py contains the intentional demo assertion, delete tests/test_training_failure.py.
-            - Prefer the smallest change that fixes the RCA.
-            - Do not remove human approval gates.
-            - Do not hard-code secrets.
-            - Do not add dependencies unless necessary.
-            - Preserve pytest, Docker build, and /health validation.
-            - If no safe code change is possible (for example, only a missing secret), return an empty files list and explain the manual fix in summary.
+            - Use action="delete" only for allow-listed files clearly proven to be the root cause.
+            - Never hard-code secrets.
+            - Never remove human approval gates.
+            - Never weaken pytest, Docker build, or /health validation.
+            - Do not add dependencies unless necessary and justified.
+            - Prefer the smallest patch that passes validation.
+            - If the problem is only an external secret/infrastructure issue, return an empty files list and explain the manual fix.
+
+            Project invariants:
+            - Flask app standard port is 5000.
+            - Docker/gunicorn should listen on 0.0.0.0:5000.
+            - Docker port mapping should be 5000:5000.
+            - Health check URL should be http://localhost:5000/health or http://127.0.0.1:5000/health.
+            - deploy.yml docker-publish must depend on both validate and pytest.
+            - Production deployment must stay behind the production environment approval.
+            - Docker publishing must stay behind the docker-publish environment approval.
+
+            Known training/demo remediation:
+            - If pytest fails because tests/test_training_failure.py contains "Training pytest failure for AI RCA demo" and assert False, delete tests/test_training_failure.py.
             """
         ).strip(),
     )
@@ -360,73 +389,104 @@ def build_remediation_prompt(issue_body: str, logs: str, context: str) -> str:
 
 def fallback_remediation(output_dir: pathlib.Path) -> dict:
     plan = {
-        "summary": "No AI model response was available. No automatic code changes were applied. Manual remediation is required based on the RCA artifact.",
-        "risk": "low - no repository files were changed",
-        "validation": ["Review the RCA artifact", "Fix secrets/configuration manually", "Rerun the failed workflow"],
+        "summary": "No AI model response was available. Deterministic remediations, if any, were attempted. Manual remediation may be required based on the RCA artifact.",
+        "risk": "low - only deterministic allow-listed remediations can be applied without the AI provider",
+        "validation": ["Review the RCA artifact", "Fix secrets/configuration manually if required", "Rerun the failed workflow"],
         "files": [],
     }
-    (output_dir / "remediation-plan.md").write_text(
-        "# AI Agent Remediation Plan\n\nNo automatic patch was produced because the AI provider was unavailable.\n",
+    (output_dir / "ai-provider-status.txt").write_text(
+        "AI provider unavailable or not configured; deterministic remediation only.\n",
         encoding="utf-8",
     )
     return plan
 
 
-def apply_safe_deterministic_remediations(repo_root: pathlib.Path, logs: str, issue_body: str) -> list[tuple[str, str]]:
-    """Apply narrowly-scoped deterministic fixes for known training/demo failures.
+def manual_only_failure(logs: str, issue_body: str) -> bool:
+    text = f"{logs}\n{issue_body}".lower()
+    return any(hint in text for hint in MANUAL_ONLY_HINTS)
 
-    This is intentionally conservative. It only removes the exact training failure
-    file when the failed RCA/logs mention that same file and the file contains the
-    expected demo marker.
-    """
+
+def replace_if_changed(path: pathlib.Path, new_content: str, reason: str) -> list[tuple[str, str]]:
+    old = read_text(path) if path.exists() else ""
+    if old != new_content:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(new_content.rstrip() + "\n", encoding="utf-8")
+        rel = str(path).replace(str(ROOT_DEFAULT), "").lstrip("/")
+        return [(rel, reason)]
+    return []
+
+
+def apply_safe_deterministic_remediations(repo_root: pathlib.Path, logs: str, issue_body: str, validation_feedback: str = "") -> list[tuple[str, str]]:
+    """Apply narrowly-scoped deterministic fixes for known safe repository failures."""
     changed: list[tuple[str, str]] = []
-    combined_context = f"{logs}\n{issue_body}"
-    target = repo_root / "tests/test_training_failure.py"
 
-    target_content = read_text(target)
+    # 1. Remove the exact intentional pytest demo failure.
+    training_test = repo_root / "tests/test_training_failure.py"
+    training_content = read_text(training_test)
     if (
-        target.exists()
-        and "Training pytest failure for AI RCA demo" in target_content
-        and "assert False" in target_content
+        training_test.exists()
+        and "Training pytest failure for AI RCA demo" in training_content
+        and "assert False" in training_content
     ):
-        target.unlink()
+        training_test.unlink()
         changed.append((
             "tests/test_training_failure.py",
-            "Removed the intentional training pytest failure identified in RCA/logs so the remediation PR can pass pytest.",
+            "Removed the intentional training pytest failure so pytest can pass.",
         ))
+
+    # 2. Restore standard project port 5000 in deploy.yml when a demo mistake changes it to 500.
+    deploy_yml = repo_root / ".github/workflows/deploy.yml"
+    if deploy_yml.exists():
+        content = read_text(deploy_yml)
+        updated = content
+        updated = re.sub(r"(localhost|127\.0\.0\.1):500/health", r"\1:5000/health", updated)
+        updated = re.sub(r"(?<=-p )(?:500|5000):(?:500|5000)\b", "5000:5000", updated)
+        updated = re.sub(r"(?<=--publish )(?:500|5000):(?:500|5000)\b", "5000:5000", updated)
+        if updated != content:
+            deploy_yml.write_text(updated.rstrip() + "\n", encoding="utf-8")
+            changed.append((
+                ".github/workflows/deploy.yml",
+                "Restored the project standard port 5000 in Docker port mapping and/or health check URL.",
+            ))
+
+    # 3. Restore standard port 5000 in Dockerfile when a demo mistake changes it to 500.
+    dockerfile = repo_root / "Dockerfile"
+    if dockerfile.exists():
+        content = read_text(dockerfile)
+        updated = content
+        replacements = {
+            "EXPOSE 500\n": "EXPOSE 5000\n",
+            "0.0.0.0:500\"": "0.0.0.0:5000\"",
+            "0.0.0.0:500,": "0.0.0.0:5000,",
+            "127.0.0.1:500/health": "127.0.0.1:5000/health",
+            "localhost:500/health": "localhost:5000/health",
+        }
+        for old, new in replacements.items():
+            updated = updated.replace(old, new)
+        if updated != content:
+            dockerfile.write_text(updated.rstrip() + "\n", encoding="utf-8")
+            changed.append((
+                "Dockerfile",
+                "Restored the project standard container port 5000 in Dockerfile.",
+            ))
+
+    # 4. Restore app.run port in app.py if the standard was accidentally changed.
+    app_py = repo_root / "app.py"
+    if app_py.exists():
+        content = read_text(app_py)
+        updated = content
+        updated = re.sub(r"app\.run\(host=(['\"])0\.0\.0\.0\1,\s*port=500\)", r"app.run(host=\g<1>0.0.0.0\g<1>, port=5000)", updated)
+        if updated != content:
+            app_py.write_text(updated.rstrip() + "\n", encoding="utf-8")
+            changed.append((
+                "app.py",
+                "Restored Flask development server port 5000.",
+            ))
 
     return changed
 
 
-def remediate(args: argparse.Namespace) -> int:
-    repo_root = pathlib.Path(args.repo_root).resolve()
-    output_dir = pathlib.Path(args.output_dir).resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    issue_body = read_text(pathlib.Path(args.issue_body), 30_000) if args.issue_body else ""
-    logs = collect_logs(pathlib.Path(args.logs_dir) if args.logs_dir else None, pathlib.Path(args.logs_file) if args.logs_file else None)
-    context = collect_repo_context(repo_root)
-
-    system_instruction = (
-        "You are a cautious DevOps code remediation agent. You only propose minimal, "
-        "reviewable patches for GitHub Actions, Docker, pytest, and deployment automation after "
-        "human approval. Return valid JSON only."
-    )
-    prompt = build_remediation_prompt(issue_body, logs, context)
-    ai_text = call_gemini(prompt, system_instruction)
-
-    if not ai_text or ai_text.startswith("AI model unavailable") or ai_text.startswith("AI model call failed"):
-        plan = fallback_remediation(output_dir)
-        if ai_text:
-            with (output_dir / "ai-provider-status.txt").open("w", encoding="utf-8") as f:
-                f.write(sanitize(ai_text) + "\n")
-    else:
-        try:
-            plan = extract_json(ai_text)
-        except Exception as exc:
-            (output_dir / "raw-ai-response.txt").write_text(sanitize(ai_text), encoding="utf-8")
-            raise SystemExit(f"AI response was not valid JSON: {exc}") from exc
-
+def apply_ai_plan(repo_root: pathlib.Path, plan: dict) -> list[tuple[str, str]]:
     changed: list[tuple[str, str]] = []
     for file_spec in plan.get("files", []):
         path = validate_path(str(file_spec.get("path", "")))
@@ -451,13 +511,132 @@ def remediate(args: argparse.Namespace) -> int:
         if existing != content:
             target.write_text(content.rstrip() + "\n", encoding="utf-8")
             changed.append((path, reason))
+    return changed
 
-    changed.extend(apply_safe_deterministic_remediations(repo_root, logs, issue_body))
 
+def run_process(args: list[str], cwd: pathlib.Path, timeout: int = 180) -> tuple[bool, str]:
+    try:
+        result = subprocess.run(
+            args,
+            cwd=str(cwd),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=timeout,
+        )
+        output = result.stdout or ""
+        return result.returncode == 0, f"$ {' '.join(args)}\n{output}\n(exit code: {result.returncode})"
+    except subprocess.TimeoutExpired as exc:
+        output = exc.stdout or ""
+        if isinstance(output, bytes):
+            output = output.decode("utf-8", errors="replace")
+        return False, f"$ {' '.join(args)}\nTIMEOUT after {timeout}s\n{output}"
+    except Exception as exc:
+        return False, f"$ {' '.join(args)}\nERROR: {exc}"
+
+
+def docker_health_check(container_name: str, timeout_seconds: int = 30) -> tuple[bool, str]:
+    deadline = time.time() + timeout_seconds
+    last_error = ""
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen("http://127.0.0.1:5000/health", timeout=2) as response:
+                body = response.read().decode("utf-8", errors="replace")
+                if response.status == 200:
+                    return True, f"Health check passed: HTTP {response.status} {body}"
+        except Exception as exc:  # pragma: no cover - timing/network dependent
+            last_error = str(exc)
+            time.sleep(2)
+    return False, f"Health check failed for {container_name}: {last_error}"
+
+
+def run_validation_suite(repo_root: pathlib.Path, output_dir: pathlib.Path, attempt: int, skip_docker: bool = False) -> dict:
+    logs: list[str] = [f"# Validation attempt {attempt} at {now_utc()}"]
+
+    checks = [
+        ("Python compile", [sys.executable, "-m", "py_compile", "app.py", "scripts/ai_ci_agent.py"]),
+        ("Pytest", ["pytest", "-q"]),
+    ]
+    for name, command in checks:
+        ok, output = run_process(command, repo_root, timeout=180)
+        logs.append(f"\n## {name}\n{output}")
+        if not ok:
+            text = "\n".join(logs)
+            (output_dir / f"validation-attempt-{attempt}.log").write_text(text, encoding="utf-8")
+            return {"ok": False, "failed_at": name, "log": text}
+
+    if skip_docker or os.environ.get("AI_AGENT_SKIP_DOCKER_VALIDATION", "").lower() in {"1", "true", "yes"}:
+        logs.append("\n## Docker validation\nSkipped by configuration.")
+        text = "\n".join(logs)
+        (output_dir / f"validation-attempt-{attempt}.log").write_text(text, encoding="utf-8")
+        return {"ok": True, "failed_at": "", "log": text}
+
+    if not shutil.which("docker"):
+        logs.append("\n## Docker validation\nDocker executable was not found on the runner.")
+        text = "\n".join(logs)
+        (output_dir / f"validation-attempt-{attempt}.log").write_text(text, encoding="utf-8")
+        return {"ok": False, "failed_at": "Docker available", "log": text}
+
+    image = f"local/devops-ai-assistant:ai-agent-validation-{os.environ.get('GITHUB_RUN_ID', 'local')}-{attempt}"
+    container = f"ai-agent-validation-{os.environ.get('GITHUB_RUN_ID', 'local')}-{attempt}"
+
+    run_process(["docker", "rm", "-f", container], repo_root, timeout=60)
+
+    ok, output = run_process(["docker", "build", "-t", image, "."], repo_root, timeout=600)
+    logs.append(f"\n## Docker build\n{output}")
+    if not ok:
+        text = "\n".join(logs)
+        (output_dir / f"validation-attempt-{attempt}.log").write_text(text, encoding="utf-8")
+        return {"ok": False, "failed_at": "Docker build", "log": text}
+
+    ok, output = run_process([
+        "docker", "run", "-d",
+        "-p", "5000:5000",
+        "-e", "GEMINI_API_KEY=dummy-for-healthcheck",
+        "--name", container,
+        image,
+    ], repo_root, timeout=120)
+    logs.append(f"\n## Docker run\n{output}")
+    if not ok:
+        text = "\n".join(logs)
+        (output_dir / f"validation-attempt-{attempt}.log").write_text(text, encoding="utf-8")
+        return {"ok": False, "failed_at": "Docker run", "log": text}
+
+    try:
+        ok, health_output = docker_health_check(container)
+        logs.append(f"\n## Container /health smoke test\n{health_output}")
+        docker_logs_ok, docker_logs = run_process(["docker", "logs", container], repo_root, timeout=60)
+        logs.append(f"\n## Container logs\n{docker_logs}")
+        if not ok:
+            text = "\n".join(logs)
+            (output_dir / f"validation-attempt-{attempt}.log").write_text(text, encoding="utf-8")
+            return {"ok": False, "failed_at": "Container health", "log": text}
+    finally:
+        cleanup_ok, cleanup_output = run_process(["docker", "rm", "-f", container], repo_root, timeout=60)
+        logs.append(f"\n## Docker cleanup\n{cleanup_output}")
+
+    text = "\n".join(logs)
+    (output_dir / f"validation-attempt-{attempt}.log").write_text(text, encoding="utf-8")
+    return {"ok": True, "failed_at": "", "log": text}
+
+
+def dedupe_changes(changes: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    seen: set[tuple[str, str]] = set()
+    result: list[tuple[str, str]] = []
+    for path, reason in changes:
+        key = (path, reason)
+        if key not in seen:
+            seen.add(key)
+            result.append((path, reason))
+    return result
+
+
+def write_remediation_artifacts(output_dir: pathlib.Path, plan: dict, changes: list[tuple[str, str]], attempts: list[dict], success: bool) -> None:
     plan_md = [
         "# AI Agent Remediation Plan",
         "",
         f"Generated: {now_utc()}",
+        f"Status: {'success' if success else 'failed'}",
         "",
         "## Summary",
         "",
@@ -470,21 +649,120 @@ def remediate(args: argparse.Namespace) -> int:
         "## Changed files",
         "",
     ]
-    if changed:
-        for path, reason in changed:
+    if changes:
+        for path, reason in dedupe_changes(changes):
             plan_md.append(f"- `{path}` — {reason}")
     else:
         plan_md.append("- No repository files were changed by the agent.")
-    plan_md.extend(["", "## Validation", ""])
+
+    plan_md.extend(["", "## Validation attempts", ""])
+    for attempt in attempts:
+        status = "passed" if attempt.get("ok") else "failed"
+        failed_at = attempt.get("failed_at") or "none"
+        plan_md.append(f"- Attempt {attempt.get('attempt')}: {status}; failed_at={failed_at}")
+
+    plan_md.extend(["", "## Validation requested by AI", ""])
     for item in plan.get("validation", []):
         plan_md.append(f"- {item}")
-    (output_dir / "remediation-plan.md").write_text("\n".join(plan_md).rstrip() + "\n", encoding="utf-8")
-    (output_dir / "remediation-plan.json").write_text(json.dumps(plan, indent=2), encoding="utf-8")
 
-    print(f"Changed {len(changed)} files")
-    for path, reason in changed:
-        print(f"- {path}: {reason}")
-    return 0
+    if not success:
+        plan_md.extend([
+            "",
+            "## Manual follow-up required",
+            "",
+            "The agent could not produce a validated fix within the configured retry limit. Review validation logs in this artifact and fix manually or approve a more specific remediation.",
+        ])
+
+    (output_dir / "remediation-plan.md").write_text("\n".join(plan_md).rstrip() + "\n", encoding="utf-8")
+    (output_dir / "remediation-plan.json").write_text(json.dumps({"plan": plan, "changes": changes, "attempts": attempts, "success": success}, indent=2), encoding="utf-8")
+
+
+def remediate(args: argparse.Namespace) -> int:
+    repo_root = pathlib.Path(args.repo_root).resolve()
+    output_dir = pathlib.Path(args.output_dir).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    issue_body = read_text(pathlib.Path(args.issue_body), 30_000) if args.issue_body else ""
+    logs = collect_logs(pathlib.Path(args.logs_dir) if args.logs_dir else None, pathlib.Path(args.logs_file) if args.logs_file else None)
+
+    max_attempts = max(1, int(args.max_attempts or os.environ.get("AI_AGENT_MAX_ATTEMPTS", DEFAULT_MAX_ATTEMPTS)))
+    skip_docker = bool(args.skip_docker_validation)
+    all_changes: list[tuple[str, str]] = []
+    attempts: list[dict] = []
+    latest_plan: dict = {
+        "summary": "Deterministic and AI remediation v3 with validation retry loop.",
+        "risk": "medium - modifies allow-listed CI/CD/app/test files only after human approval",
+        "validation": ["python -m py_compile", "pytest -q", "docker build", "container /health smoke test"],
+        "files": [],
+    }
+    validation_feedback = ""
+
+    if manual_only_failure(logs, issue_body):
+        (output_dir / "manual-only-detected.txt").write_text(
+            "The logs contain hints of a secrets, credentials, permissions, quota, or infrastructure issue. The agent will still run deterministic/code remediation if applicable, but manual configuration may be required.\n",
+            encoding="utf-8",
+        )
+
+    for attempt in range(1, max_attempts + 1):
+        print(f"=== AI remediation v3 attempt {attempt}/{max_attempts} ===")
+
+        deterministic_changes = apply_safe_deterministic_remediations(repo_root, logs, issue_body, validation_feedback)
+        all_changes.extend(deterministic_changes)
+        for path, reason in deterministic_changes:
+            print(f"Deterministic remediation: {path}: {reason}")
+
+        context = collect_repo_context(repo_root)
+        system_instruction = (
+            "You are a cautious DevOps code remediation agent. You only propose minimal, "
+            "reviewable patches for GitHub Actions, Docker, pytest, app.py, and deployment automation after "
+            "human approval. Return valid JSON only."
+        )
+        prompt = build_remediation_prompt(issue_body, logs, context, attempt, validation_feedback)
+        ai_text = call_gemini(prompt, system_instruction)
+
+        if not ai_text or ai_text.startswith("AI model unavailable") or ai_text.startswith("AI model call failed"):
+            latest_plan = fallback_remediation(output_dir)
+            if ai_text:
+                with (output_dir / f"ai-provider-status-attempt-{attempt}.txt").open("w", encoding="utf-8") as f:
+                    f.write(sanitize(ai_text) + "\n")
+        else:
+            try:
+                latest_plan = extract_json(ai_text)
+                (output_dir / f"ai-plan-attempt-{attempt}.json").write_text(json.dumps(latest_plan, indent=2), encoding="utf-8")
+                ai_changes = apply_ai_plan(repo_root, latest_plan)
+                all_changes.extend(ai_changes)
+                for path, reason in ai_changes:
+                    print(f"AI remediation: {path}: {reason}")
+            except Exception as exc:
+                (output_dir / f"raw-ai-response-attempt-{attempt}.txt").write_text(sanitize(ai_text), encoding="utf-8")
+                validation_feedback = f"AI response was not valid/applicable JSON: {exc}"
+                attempts.append({"attempt": attempt, "ok": False, "failed_at": "AI JSON/apply", "log": validation_feedback})
+                continue
+
+        # Re-run deterministic remediation after the AI plan in case the AI missed a known safe issue.
+        post_ai_changes = apply_safe_deterministic_remediations(repo_root, logs, issue_body, validation_feedback)
+        all_changes.extend(post_ai_changes)
+        for path, reason in post_ai_changes:
+            print(f"Post-AI deterministic remediation: {path}: {reason}")
+
+        validation = run_validation_suite(repo_root, output_dir, attempt, skip_docker=skip_docker)
+        validation["attempt"] = attempt
+        attempts.append(validation)
+        validation_feedback = validation.get("log", "")[-MAX_LOG_CHARS:]
+
+        if validation.get("ok"):
+            print(f"Validation passed on attempt {attempt}")
+            write_remediation_artifacts(output_dir, latest_plan, all_changes, attempts, success=True)
+            print(f"Changed {len(dedupe_changes(all_changes))} files")
+            for path, reason in dedupe_changes(all_changes):
+                print(f"- {path}: {reason}")
+            return 0
+
+        print(f"Validation failed on attempt {attempt}: {validation.get('failed_at')}")
+
+    write_remediation_artifacts(output_dir, latest_plan, all_changes, attempts, success=False)
+    print(f"AI remediation v3 failed after {max_attempts} attempts")
+    return 1
 
 
 def main(argv: Iterable[str] | None = None) -> int:
@@ -504,6 +782,8 @@ def main(argv: Iterable[str] | None = None) -> int:
 
     p_remediate = sub.add_parser("remediate", parents=[common])
     p_remediate.add_argument("--issue-body", required=True)
+    p_remediate.add_argument("--max-attempts", type=int, default=None)
+    p_remediate.add_argument("--skip-docker-validation", action="store_true")
     p_remediate.set_defaults(func=remediate)
 
     args = parser.parse_args(list(argv) if argv is not None else None)
