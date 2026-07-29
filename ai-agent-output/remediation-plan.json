@@ -1,0 +1,10 @@
+{
+  "summary": "No AI model response was available. No automatic code changes were applied. Manual remediation is required based on the RCA artifact.",
+  "risk": "low - no repository files were changed",
+  "validation": [
+    "Review the RCA artifact",
+    "Fix secrets/configuration manually",
+    "Rerun the failed workflow"
+  ],
+  "files": []
+}
