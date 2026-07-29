@@ -383,11 +383,11 @@ def apply_safe_deterministic_remediations(repo_root: pathlib.Path, logs: str, is
     combined_context = f"{logs}\n{issue_body}"
     target = repo_root / "tests/test_training_failure.py"
 
+    target_content = read_text(target)
     if (
         target.exists()
-        and "tests/test_training_failure.py" in combined_context
-        and "Training pytest failure for AI RCA demo" in read_text(target)
-        and "assert False" in read_text(target)
+        and "Training pytest failure for AI RCA demo" in target_content
+        and "assert False" in target_content
     ):
         target.unlink()
         changed.append((
