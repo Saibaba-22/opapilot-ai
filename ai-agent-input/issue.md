@@ -1,9 +1,9 @@
-# AI RCA: CI/CD failure in run 30453375337
+# AI RCA: CI/CD failure in run 30469652288
 
 # AI Agent RCA Artifact
 
-Generated: 2026-07-29T12:52:57Z
-Run ID: 30453375337
+Generated: 2026-07-29T16:15:45Z
+Run ID: 30469652288
 
 ## Executive summary
 
@@ -12,7 +12,6 @@ The AI provider was not available, so this is a deterministic fallback RCA. The 
 ## Most likely root cause
 
 - Docker build/buildx failure. Review Dockerfile, requirements install output, and image build context.
-- Pytest failure. Review the failing test name, assertion, and related app/test code.
 
 ## Recommended solution options
 
