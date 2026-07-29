@@ -189,7 +189,7 @@ jobs:
 
             echo "Verifying container health..."
             for i in {1..10}; do
-              if curl -fsS http://localhost:5000/health; then
+              if curl -fsS http://localhost:500/health; then
                 echo "Deployment health check passed"
                 docker inspect --format='Deployed image ID: {{.Image}}' "$CONTAINER_NAME"
                 exit 0
