@@ -29,6 +29,7 @@ MAX_LOG_CHARS = 60_000
 MAX_FILE_CHARS = 18_000
 MAX_PROMPT_CHARS = 95_000
 
+
 def now_utc() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
@@ -44,6 +45,7 @@ ALLOWED_REMEDIATION_PATHS = (
     "requirements-dev.txt",
     "app.py",
     "tests/test_app.py",
+    "tests/test_training_failure.py",
     "README.md",
     "docs/AI_AGENT_RUNBOOK.md",
     "scripts/ai_ci_agent.py",
@@ -156,6 +158,8 @@ def fallback_analysis(run_id: str, logs: str, context: str) -> str:
         )
     if "docker build" in lower or "buildx" in lower:
         likely.append("Docker build/buildx failure. Review Dockerfile, requirements install output, and image build context.")
+    if "pytest" in lower or "assertionerror" in lower:
+        likely.append("Pytest failure. Review the failing test name, assertion, and related app/test code.")
     if "curl" in lower and "/health" in lower:
         likely.append("Post-deploy health check failed. Container may not have started, app may be unhealthy, or port/security-group may be wrong.")
     if "permission denied" in lower and ("ssh" in lower or "ec2" in lower):
@@ -179,9 +183,9 @@ The AI provider was not available, so this is a deterministic fallback RCA. The 
 ## Recommended solution options
 
 1. Fix missing or invalid GitHub Actions secrets and rerun the failed workflow.
-2. Split CI/CD into validate, Docker publish, and deploy jobs so Docker publishing and production deployment can require human environment approval.
-3. Add an AI RCA workflow that creates this artifact automatically on pipeline failure.
-4. Add a human-approved remediation workflow that opens a pull request instead of pushing directly to `main`.
+2. Split CI/CD into validate, pytest, Docker publish, and deploy jobs so test failures block deployment.
+3. Add or use an AI RCA workflow that creates this artifact automatically on pipeline failure.
+4. Add or use a human-approved remediation workflow that opens a pull request instead of pushing directly to `main`.
 
 ## Validation plan
 
@@ -218,7 +222,7 @@ def build_analysis_prompt(run_id: str, repo: str, metadata: str, logs: str, cont
             4. Contributing factors
             5. Solution options, including safest option and tradeoffs
             6. Recommended remediation plan with file-level changes
-            7. Validation plan for GitHub Actions, Docker build, container health check, and deployment
+            7. Validation plan for GitHub Actions, pytest, Docker build, container health check, and deployment
             8. Rollback plan
             9. Human approval instructions
 
@@ -245,7 +249,7 @@ def analyze(args: argparse.Namespace) -> int:
 
     system_instruction = (
         "You are a senior DevOps incident responder. Analyze GitHub Actions, Docker, "
-        "and deployment failures. Produce RCA and remediation plans only; never suggest "
+        "pytest, and deployment failures. Produce RCA and remediation plans only; never suggest "
         "direct production changes without human approval."
     )
     prompt = build_analysis_prompt(run_id, repo, metadata, logs, context)
@@ -282,7 +286,7 @@ If you approve the agent to prepare a fix, comment exactly:
 The remediation workflow will then:
 
 1. create a new branch,
-2. apply an allow-listed CI/CD/Docker remediation only,
+2. apply an allow-listed CI/CD/Docker/test remediation only,
 3. run Python, pytest, and Docker validation,
 4. open a pull request for human review.
 
@@ -334,13 +338,15 @@ def build_remediation_prompt(issue_body: str, logs: str, context: str) -> str:
               "risk": "low|medium|high plus explanation",
               "validation": ["validation command or check", "..."],
               "files": [
-                {{"path": "relative/path", "reason": "why this file changes", "content": "complete new file content"}}
+                {{"path": "relative/path", "action": "write|delete", "reason": "why this file changes", "content": "complete new file content when action is write"}}
               ]
             }}
 
             Constraints:
             - You may edit only these files: {', '.join(ALLOWED_REMEDIATION_PATHS)}.
-            - Return complete replacement content for each changed file.
+            - Use action="write" when replacing/creating a file and include complete replacement content.
+            - Use action="delete" only for allow-listed files that are clearly the root cause.
+            - If pytest fails because tests/test_training_failure.py contains the intentional demo assertion, delete tests/test_training_failure.py.
             - Prefer the smallest change that fixes the RCA.
             - Do not remove human approval gates.
             - Do not hard-code secrets.
@@ -366,6 +372,32 @@ def fallback_remediation(output_dir: pathlib.Path) -> dict:
     return plan
 
 
+def apply_safe_deterministic_remediations(repo_root: pathlib.Path, logs: str, issue_body: str) -> list[tuple[str, str]]:
+    """Apply narrowly-scoped deterministic fixes for known training/demo failures.
+
+    This is intentionally conservative. It only removes the exact training failure
+    file when the failed RCA/logs mention that same file and the file contains the
+    expected demo marker.
+    """
+    changed: list[tuple[str, str]] = []
+    combined_context = f"{logs}\n{issue_body}"
+    target = repo_root / "tests/test_training_failure.py"
+
+    if (
+        target.exists()
+        and "tests/test_training_failure.py" in combined_context
+        and "Training pytest failure for AI RCA demo" in read_text(target)
+        and "assert False" in read_text(target)
+    ):
+        target.unlink()
+        changed.append((
+            "tests/test_training_failure.py",
+            "Removed the intentional training pytest failure identified in RCA/logs so the remediation PR can pass pytest.",
+        ))
+
+    return changed
+
+
 def remediate(args: argparse.Namespace) -> int:
     repo_root = pathlib.Path(args.repo_root).resolve()
     output_dir = pathlib.Path(args.output_dir).resolve()
@@ -377,7 +409,7 @@ def remediate(args: argparse.Namespace) -> int:
 
     system_instruction = (
         "You are a cautious DevOps code remediation agent. You only propose minimal, "
-        "reviewable patches for GitHub Actions, Docker, and deployment automation after "
+        "reviewable patches for GitHub Actions, Docker, pytest, and deployment automation after "
         "human approval. Return valid JSON only."
     )
     prompt = build_remediation_prompt(issue_body, logs, context)
@@ -398,15 +430,29 @@ def remediate(args: argparse.Namespace) -> int:
     changed: list[tuple[str, str]] = []
     for file_spec in plan.get("files", []):
         path = validate_path(str(file_spec.get("path", "")))
+        action = str(file_spec.get("action", "write")).lower().strip()
+        reason = str(file_spec.get("reason", "No reason provided"))
+        target = repo_root / path
+
+        if action == "delete":
+            if target.exists():
+                target.unlink()
+                changed.append((path, reason))
+            continue
+
+        if action != "write":
+            raise ValueError(f"Unsupported action for {path}: {action}")
+
         content = file_spec.get("content")
         if not isinstance(content, str):
             raise ValueError(f"File {path} has no string content")
-        target = repo_root / path
         target.parent.mkdir(parents=True, exist_ok=True)
         existing = read_text(target) if target.exists() else None
         if existing != content:
             target.write_text(content.rstrip() + "\n", encoding="utf-8")
-            changed.append((path, str(file_spec.get("reason", "No reason provided"))))
+            changed.append((path, reason))
+
+    changed.extend(apply_safe_deterministic_remediations(repo_root, logs, issue_body))
 
     plan_md = [
         "# AI Agent Remediation Plan",
