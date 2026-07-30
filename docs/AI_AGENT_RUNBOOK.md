@@ -147,7 +147,14 @@ If validation fails, the validation output is fed into the next remediation atte
 Known deterministic safe remediations include:
 
 - removing the exact intentional training failure file `tests/test_training_failure.py` when it contains `Training pytest failure for AI RCA demo` and `assert False`;
-- restoring the project standard port `5000` in `deploy.yml`, Dockerfile, and `app.py` when a demo mistake changes it to `500`.
+- restoring the project standard port `5000` in `deploy.yml`, Dockerfile, and `app.py` when a demo mistake changes it to `500`;
+- restoring GitHub workflow expressions if an older remediation accidentally wrote sanitized placeholders such as `***MASKED*** secrets.DOCKERHUB_TOKEN }}`.
+
+Enhanced AI Remediation v3.1 also protects against masked placeholder commits:
+
+- GitHub expressions like `${{ secrets.DOCKERHUB_TOKEN }}` are preserved when repository files are sent to the AI prompt.
+- The agent refuses to write allow-listed files if the AI response contains `***MASKED***` placeholders.
+- The validation suite fails before PR creation if any allow-listed output file contains masked placeholders.
 
 The agent still will not fix secrets or infrastructure directly. For expired Docker tokens, wrong EC2 SSH keys, blocked security groups, quota/rate-limit problems, or unavailable cloud resources, it creates artifacts explaining the required manual action.
 

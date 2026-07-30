@@ -65,7 +65,7 @@ A human must approve remediation by commenting this on the RCA issue:
 /ai-agent approve
 ```
 
-After approval, the v3 remediation agent creates a branch, applies allow-listed fixes for `app.py`, `deploy.yml`, Docker, requirements, and tests, then runs a validation retry loop: Python compile, pytest, Docker build, and container `/health`. If validation fails, it feeds the validation logs back into the next AI attempt. When validation passes, it opens a pull request. A human still reviews/merges the PR. Docker publishing and production deployment are gated by GitHub Environments named `docker-publish` and `production`.
+After approval, the v3.1 remediation agent creates a branch, applies allow-listed fixes for `app.py`, `deploy.yml`, Docker, requirements, and tests, then runs a validation retry loop: Python compile, pytest, Docker build, and container `/health`. If validation fails, it feeds the validation logs back into the next AI attempt. v3.1 also prevents masked placeholder commits by preserving GitHub expressions like `${{ secrets.DOCKERHUB_TOKEN }}` and refusing to write `***MASKED***` placeholders into workflow files. When validation passes, it opens a pull request. A human still reviews/merges the PR. Docker publishing and production deployment are gated by GitHub Environments named `docker-publish` and `production`.
 
 See `docs/AI_AGENT_RUNBOOK.md` for setup details.
 

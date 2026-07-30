@@ -76,11 +76,22 @@ CONTEXT_PATTERNS = (
 )
 
 SECRET_PATTERNS = [
+    # Mask concrete key/token/password assignments, but v3.1 protects GitHub
+    # expression references like ${{ secrets.DOCKERHUB_TOKEN }} before this runs.
     (re.compile(r"(?i)(api[_-]?key|token|password|secret|private[_-]?key)(\s*[:=]\s*)([^\s'\"]+)"), r"\1\2***MASKED***"),
     (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", re.S), "***MASKED_PRIVATE_KEY***"),
     (re.compile(r"AKIA[0-9A-Z]{16}"), "***MASKED_AWS_ACCESS_KEY***"),
     (re.compile(r"(?i)gh[pousr]_[A-Za-z0-9_]{20,}"), "***MASKED_GITHUB_TOKEN***"),
 ]
+
+GITHUB_EXPRESSION_PATTERN = re.compile(r"\$\{\{\s*(?:secrets|vars)\.[A-Za-z_][A-Za-z0-9_]*\s*\}\}")
+MASKED_PLACEHOLDER_MARKERS = (
+    "***MASKED***",
+    "***MASKED_PRIVATE_KEY***",
+    "***MASKED_AWS_ACCESS_KEY***",
+    "***MASKED_GITHUB_TOKEN***",
+)
+MASKED_SCAN_EXCLUDED_PATHS = {"scripts/ai_ci_agent.py"}
 
 MANUAL_ONLY_HINTS = (
     "docker login", "unauthorized", "denied: requested access", "authentication required",
@@ -90,21 +101,61 @@ MANUAL_ONLY_HINTS = (
 
 
 def sanitize(text: str) -> str:
-    """Best-effort masking before sending data to an LLM or artifact."""
+    """Best-effort masking before sending data to an LLM or artifact.
+
+    v3.1 protection: GitHub expressions such as `${{ secrets.NAME }}` and
+    `${{ vars.NAME }}` are references, not secret values. They must remain
+    syntactically intact in AI prompts, otherwise the AI may write
+    `***MASKED*** secrets.NAME }}` back into workflow files.
+    """
+    protected: list[tuple[str, str]] = []
+
+    def protect(match: re.Match[str]) -> str:
+        token = f"__GITHUB_EXPR_{len(protected)}__"
+        protected.append((token, match.group(0)))
+        # Quote the placeholder so key/password sanitizers do not treat it as a
+        # concrete secret value. The quotes are removed when the token is restored.
+        return f'"{token}"'
+
+    text = GITHUB_EXPRESSION_PATTERN.sub(protect, text)
     for pattern, replacement in SECRET_PATTERNS:
         text = pattern.sub(replacement, text)
+    for token, original in protected:
+        text = text.replace(f'"{token}"', original)
+        text = text.replace(token, original)
     return text
 
 
-def read_text(path: pathlib.Path, limit: int | None = None) -> str:
+def read_raw_text(path: pathlib.Path, limit: int | None = None) -> str:
     try:
         data = path.read_text(encoding="utf-8", errors="replace")
     except FileNotFoundError:
         return ""
-    data = sanitize(data)
     if limit and len(data) > limit:
         return data[:limit] + f"\n\n...[truncated to {limit} characters]...\n"
     return data
+
+
+def read_text(path: pathlib.Path, limit: int | None = None) -> str:
+    data = sanitize(read_raw_text(path))
+    if limit and len(data) > limit:
+        return data[:limit] + f"\n\n...[truncated to {limit} characters]...\n"
+    return data
+
+
+def contains_masked_placeholder(text: str) -> bool:
+    return any(marker in text for marker in MASKED_PLACEHOLDER_MARKERS)
+
+
+def scan_masked_placeholders(repo_root: pathlib.Path) -> list[str]:
+    findings: list[str] = []
+    for rel in ALLOWED_REMEDIATION_PATHS:
+        if rel in MASKED_SCAN_EXCLUDED_PATHS:
+            continue
+        path = repo_root / rel
+        if path.exists() and contains_masked_placeholder(read_raw_text(path)):
+            findings.append(rel)
+    return findings
 
 
 def collect_logs(logs_dir: pathlib.Path | None, logs_file: pathlib.Path | None) -> str:
@@ -407,7 +458,7 @@ def manual_only_failure(logs: str, issue_body: str) -> bool:
 
 
 def replace_if_changed(path: pathlib.Path, new_content: str, reason: str) -> list[tuple[str, str]]:
-    old = read_text(path) if path.exists() else ""
+    old = read_raw_text(path) if path.exists() else ""
     if old != new_content:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(new_content.rstrip() + "\n", encoding="utf-8")
@@ -422,7 +473,7 @@ def apply_safe_deterministic_remediations(repo_root: pathlib.Path, logs: str, is
 
     # 1. Remove the exact intentional pytest demo failure.
     training_test = repo_root / "tests/test_training_failure.py"
-    training_content = read_text(training_test)
+    training_content = read_raw_text(training_test)
     if (
         training_test.exists()
         and "Training pytest failure for AI RCA demo" in training_content
@@ -437,8 +488,14 @@ def apply_safe_deterministic_remediations(repo_root: pathlib.Path, logs: str, is
     # 2. Restore standard project port 5000 in deploy.yml when a demo mistake changes it to 500.
     deploy_yml = repo_root / ".github/workflows/deploy.yml"
     if deploy_yml.exists():
-        content = read_text(deploy_yml)
+        content = read_raw_text(deploy_yml)
         updated = content
+        # v3.1 recovery: restore GitHub expressions if an older remediation wrote
+        # sanitized placeholders back into deploy.yml.
+        updated = updated.replace("password: ***MASKED*** secrets.DOCKERHUB_TOKEN }}", "password: ${{ secrets.DOCKERHUB_TOKEN }}")
+        updated = updated.replace("DOCKERHUB_TOKEN: ***MASKED*** secrets.DOCKERHUB_TOKEN }}", "DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}")
+        updated = updated.replace("GEMINI_API_KEY: ***MASKED*** secrets.GEMINI_API_KEY }}", "GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}")
+        updated = updated.replace("-e GEMINI_API_KEY=***MASKED*** \\", "-e GEMINI_API_KEY=dummy-for-healthcheck \\")
         updated = re.sub(r"(localhost|127\.0\.0\.1):500/health", r"\1:5000/health", updated)
         updated = re.sub(r"(?<=-p )(?:500|5000):(?:500|5000)\b", "5000:5000", updated)
         updated = re.sub(r"(?<=--publish )(?:500|5000):(?:500|5000)\b", "5000:5000", updated)
@@ -452,7 +509,7 @@ def apply_safe_deterministic_remediations(repo_root: pathlib.Path, logs: str, is
     # 3. Restore standard port 5000 in Dockerfile when a demo mistake changes it to 500.
     dockerfile = repo_root / "Dockerfile"
     if dockerfile.exists():
-        content = read_text(dockerfile)
+        content = read_raw_text(dockerfile)
         updated = content
         replacements = {
             "EXPOSE 500\n": "EXPOSE 5000\n",
@@ -473,7 +530,7 @@ def apply_safe_deterministic_remediations(repo_root: pathlib.Path, logs: str, is
     # 4. Restore app.run port in app.py if the standard was accidentally changed.
     app_py = repo_root / "app.py"
     if app_py.exists():
-        content = read_text(app_py)
+        content = read_raw_text(app_py)
         updated = content
         updated = re.sub(r"app\.run\(host=(['\"])0\.0\.0\.0\1,\s*port=500\)", r"app.run(host=\g<1>0.0.0.0\g<1>, port=5000)", updated)
         if updated != content:
@@ -506,8 +563,13 @@ def apply_ai_plan(repo_root: pathlib.Path, plan: dict) -> list[tuple[str, str]]:
         content = file_spec.get("content")
         if not isinstance(content, str):
             raise ValueError(f"File {path} has no string content")
+        if path not in MASKED_SCAN_EXCLUDED_PATHS and contains_masked_placeholder(content):
+            raise ValueError(
+                f"Refusing to write masked placeholder into {path}. "
+                "The AI response appears to contain sanitized secret placeholders; it must preserve GitHub expressions such as ${{ secrets.NAME }}."
+            )
         target.parent.mkdir(parents=True, exist_ok=True)
-        existing = read_text(target) if target.exists() else None
+        existing = read_raw_text(target) if target.exists() else None
         if existing != content:
             target.write_text(content.rstrip() + "\n", encoding="utf-8")
             changed.append((path, reason))
@@ -552,6 +614,14 @@ def docker_health_check(container_name: str, timeout_seconds: int = 30) -> tuple
 
 def run_validation_suite(repo_root: pathlib.Path, output_dir: pathlib.Path, attempt: int, skip_docker: bool = False) -> dict:
     logs: list[str] = [f"# Validation attempt {attempt} at {now_utc()}"]
+
+    masked_findings = scan_masked_placeholders(repo_root)
+    if masked_findings:
+        text = "Masked placeholder guard failed. These files contain ***MASKED*** placeholders and will not be committed:\n" + "\n".join(masked_findings)
+        logs.append("\n## Masked placeholder guard\n" + text)
+        full_log = "\n".join(logs)
+        (output_dir / f"validation-attempt-{attempt}.log").write_text(full_log, encoding="utf-8")
+        return {"ok": False, "failed_at": "Masked placeholder guard", "log": full_log}
 
     checks = [
         ("Python compile", [sys.executable, "-m", "py_compile", "app.py", "scripts/ai_ci_agent.py"]),
