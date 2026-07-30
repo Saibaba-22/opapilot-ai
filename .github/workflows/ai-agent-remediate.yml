@@ -155,6 +155,7 @@ jobs:
             ".github/workflows/deploy.yml"
             ".github/workflows/ai-agent-rca.yml"
             ".github/workflows/ai-agent-remediate.yml"
+            ".github/workflows/ai-agent-guardian.yml"
             "Dockerfile"
             ".dockerignore"
             ".gitignore"
@@ -183,7 +184,7 @@ jobs:
           git push origin "$BRANCH"
 
           cat > ai-agent-output/pr-body.md <<EOF
-          ## AI Agent Remediation v3
+          ## AI Agent Remediation v4
 
           This pull request was created only after a human approved the RCA issue with `/ai-agent approve`.
 
@@ -191,12 +192,12 @@ jobs:
           - Failed run ID: ${RUN_ID:-not available}
           - Remediation artifact: ai-agent-remediation-${ISSUE_NUMBER}-${GITHUB_RUN_ID}
 
-          ### What v3 validates before PR creation
+          ### What v4 validates before PR creation
 
           - Python syntax validation
           - Pytest
           - Docker image build
-          - Container `/health` smoke test on port 5000
+          - Container `/health` smoke test on the dynamically discovered app port
           - Up to three remediation attempts by default when validation fails
 
           ### Safety gates

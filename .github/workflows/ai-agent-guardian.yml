@@ -1,0 +1,110 @@
+name: AI Agent - Project Health Guardian
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: ai-agent-guardian-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  project-health:
+    name: Validate project health and create RCA issue if broken
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install guardian dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-dev.txt
+
+      - name: Run project health doctor
+        id: doctor
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          python scripts/ai_ci_agent.py doctor --output-dir ai-agent-output
+
+      - name: Upload project health artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-agent-project-health-${{ github.run_id }}
+          path: ai-agent-output/
+          retention-days: 30
+
+      - name: Ensure labels exist
+        if: steps.doctor.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh label create ai-agent --color 5319E7 --description "Created by AI CI/CD remediation agent" || true
+          gh label create needs-human-approval --color FBCA04 --description "Requires maintainer approval" || true
+          gh label create project-health --color 0E8A16 --description "Project health guardian finding" || true
+
+      - name: Create project health RCA issue
+        if: steps.doctor.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cat > ai-agent-output/guardian-issue.md <<EOF
+          # AI Guardian: Project health failure
+
+          Commit: $GITHUB_SHA
+          Workflow run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
+
+          The project health guardian found policy or syntax issues in the repository. The AI remediation agent has **not** changed code yet.
+
+          EOF
+
+          cat ai-agent-output/project-health.md >> ai-agent-output/guardian-issue.md
+
+          cat >> ai-agent-output/guardian-issue.md <<EOF
+
+          ---
+
+          ## Approval gate
+
+          If you approve the AI agent to prepare a fix, comment exactly:
+
+          ```text
+          /ai-agent approve
+          ```
+
+          The remediation workflow will create a branch, attempt allow-listed fixes, validate, and open a PR. It will not merge or deploy automatically.
+          EOF
+
+          ISSUE_URL=$(gh issue create \
+            --title "AI Guardian: Project health failure in ${GITHUB_SHA:0:7}" \
+            --body-file ai-agent-output/guardian-issue.md \
+            --label ai-agent \
+            --label needs-human-approval \
+            --label project-health)
+          echo "Created guardian issue: $ISSUE_URL"
+
+      - name: Fail guardian job when project health failed
+        if: steps.doctor.outcome == 'failure'
+        run: |
+          echo "Project health failed. RCA issue and artifact were created."
+          exit 1

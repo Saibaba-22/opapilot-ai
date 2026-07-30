@@ -20,7 +20,7 @@ This project now has a human-approved AI remediation loop for GitHub Actions, Do
    /ai-agent approve
    ```
 
-6. `AI Agent - Human Approved Remediation` then runs the v3 remediation loop: it applies only allow-listed CI/CD/Docker/app/test changes, validates Python compile, pytest, Docker build, and container `/health`, retries with validation feedback when needed, and opens a pull request only after validation passes.
+6. `AI Agent - Human Approved Remediation` then runs the v4 remediation loop: it applies only allow-listed CI/CD/Docker/app/test/workflow-guardrail changes, validates project health, Python compile, pytest, Docker build, and container `/health`, retries with validation feedback when needed, and opens a pull request only after validation passes.
 7. A human reviews and merges the pull request.
 8. After merge to `main`, Docker publish and production deploy are still gated by GitHub Environment approvals.
 
@@ -44,6 +44,7 @@ Configure these in **Settings → Secrets and variables → Actions → Secrets*
 | `EC2_SSH_KEY` | Private SSH key for the `ubuntu` user on the EC2 host. |
 | `GEMINI_API_KEY` | Gemini key used by the Flask app. The AI agent also falls back to this if `AI_AGENT_API_KEY` is not set. |
 | `AI_AGENT_API_KEY` | Optional but recommended separate Gemini key for CI/CD RCA and remediation. |
+| `AI_AGENT_GITHUB_TOKEN` | GitHub token/PAT with repo and workflow permissions, required for AI remediation PRs that update `.github/workflows/*.yml`. |
 
 ## Optional GitHub variable
 
@@ -52,6 +53,7 @@ Configure under **Settings → Secrets and variables → Actions → Variables**
 | Variable | Default | Purpose |
 |---|---|---|
 | `AI_AGENT_MODEL` | `gemini-1.5-flash` | Gemini model used by the RCA/remediation agent. |
+| `AI_AGENT_MAX_ATTEMPTS` | `3` | Maximum remediation attempts before the v4 workflow stops and asks for manual review. |
 
 ## Required GitHub Environments
 
@@ -131,26 +133,50 @@ If the issue comment trigger is not desired:
 
 The `docker-publish` job depends on both `validate` and `pytest`, so Docker publishing and EC2 deployment cannot start unless pytest passes.
 
-## Enhanced AI Remediation v3
+## Enhanced AI Remediation v4 and Project Health Guardian
 
-The human-approved remediation workflow now has a validation retry loop. After `/ai-agent approve`, it can safely remediate allow-listed issues in `app.py`, `.github/workflows/deploy.yml`, Dockerfile, requirements, and tests.
+The human-approved remediation workflow has a validation retry loop. After `/ai-agent approve`, it can safely remediate allow-listed issues in `app.py`, `.github/workflows/deploy.yml`, workflow guardrails, Dockerfile, requirements, and tests.
 
-The v3 workflow validates every remediation attempt with:
+The v4 workflow validates every remediation attempt with:
 
+- Project Health Doctor checks
 - `python -m py_compile app.py scripts/ai_ci_agent.py`
 - `pytest -q`
 - `docker build`
-- a running container `/health` smoke test on port `5000`
+- a running container `/health` smoke test on the dynamically discovered app/container port
 
 If validation fails, the validation output is fed into the next remediation attempt. The default maximum is 3 attempts and can be configured with the repository variable `AI_AGENT_MAX_ATTEMPTS`.
+
+### Project Health Guardian
+
+v4 adds `.github/workflows/ai-agent-guardian.yml`. This separate workflow runs on pushes to `main` and can still detect repository policy/YAML problems even when the main deploy workflow is broken or invalid.
+
+The guardian checks:
+
+- workflow YAML syntax;
+- required project files;
+- no `***MASKED***` placeholders in output files;
+- no tracked `ai-agent-input/` or `ai-agent-output/` runtime artifacts;
+- `app.py` has Flask and `/health`;
+- Dockerfile and deploy workflow align with the discovered app/container port;
+- `docker-publish` depends on both `validate` and `pytest`;
+- Docker publishing uses the `docker-publish` environment;
+- production deploy uses the `production` environment;
+- remediation workflow uses `AI_AGENT_GITHUB_TOKEN` for workflow-file PRs.
+
+If the guardian fails, it uploads a project health artifact and opens an issue with `/ai-agent approve` instructions.
+
+### Safe deterministic remediations
 
 Known deterministic safe remediations include:
 
 - removing the exact intentional training failure file `tests/test_training_failure.py` when it contains `Training pytest failure for AI RCA demo` and `assert False`;
-- restoring the project standard port `5000` in `deploy.yml`, Dockerfile, and `app.py` when a demo mistake changes it to `500`;
+- dynamically discovering the app/container port from Dockerfile `EXPOSE`, Gunicorn bind values, `app.py` `app.run(... port=...)`, `PORT` defaults, and workflow evidence;
+- aligning wrong deploy health check ports such as `localhost:50/health` to the discovered app port;
+- aligning Docker port mappings to `DISCOVERED_PORT:DISCOVERED_PORT` when project evidence supports it;
 - restoring GitHub workflow expressions if an older remediation accidentally wrote sanitized placeholders such as `***MASKED*** secrets.DOCKERHUB_TOKEN }}`.
 
-Enhanced AI Remediation v3.1 also protects against masked placeholder commits:
+### Masked placeholder protection
 
 - GitHub expressions like `${{ secrets.DOCKERHUB_TOKEN }}` are preserved when repository files are sent to the AI prompt.
 - The agent refuses to write allow-listed files if the AI response contains `***MASKED***` placeholders.

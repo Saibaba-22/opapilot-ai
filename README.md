@@ -43,7 +43,7 @@ docker push YOUR_DOCKERHUB_USERNAME/devops-ai-assistant:latest
 |---|---|
 | `app.py` | Flask app + Gemini AI agent |
 | `requirements.txt` | Runtime Python dependencies |
-| `requirements-dev.txt` | Local/CI test dependencies, including pytest |
+| `requirements-dev.txt` | Local/CI test dependencies, including pytest and PyYAML |
 | `tests/test_app.py` | Pytest tests for Flask routes and configuration behavior |
 | `Dockerfile` | Container build instructions |
 | `.dockerignore` | Files excluded from the Docker image |
@@ -51,8 +51,9 @@ docker push YOUR_DOCKERHUB_USERNAME/devops-ai-assistant:latest
 | `.env.example` | Template for your local `GEMINI_API_KEY` |
 | `.github/workflows/deploy.yml` | CI/CD pipeline: validate + pytest → human-approved Docker publish → human-approved EC2 deploy |
 | `.github/workflows/ai-agent-rca.yml` | AI agent workflow that creates an RCA artifact/issue when CI/CD fails |
-| `.github/workflows/ai-agent-remediate.yml` | Human-approved AI remediation workflow that opens a PR |
-| `scripts/ai_ci_agent.py` | Constrained RCA/remediation agent used by GitHub Actions |
+| `.github/workflows/ai-agent-remediate.yml` | Human-approved AI remediation workflow that validates and opens a PR |
+| `.github/workflows/ai-agent-guardian.yml` | Project Health Guardian that detects broken YAML/policy issues and opens an RCA issue |
+| `scripts/ai_ci_agent.py` | Constrained RCA/remediation/project-health agent used by GitHub Actions |
 | `docs/AI_AGENT_RUNBOOK.md` | Setup and operations guide for the AI CI/CD remediation loop |
 
 ## AI CI/CD remediation agent
@@ -65,7 +66,7 @@ A human must approve remediation by commenting this on the RCA issue:
 /ai-agent approve
 ```
 
-After approval, the v3.1 remediation agent creates a branch, applies allow-listed fixes for `app.py`, `deploy.yml`, Docker, requirements, and tests, then runs a validation retry loop: Python compile, pytest, Docker build, and container `/health`. If validation fails, it feeds the validation logs back into the next AI attempt. v3.1 also prevents masked placeholder commits by preserving GitHub expressions like `${{ secrets.DOCKERHUB_TOKEN }}` and refusing to write `***MASKED***` placeholders into workflow files. When validation passes, it opens a pull request. A human still reviews/merges the PR. Docker publishing and production deployment are gated by GitHub Environments named `docker-publish` and `production`.
+After approval, the v4 remediation agent creates a branch, applies allow-listed fixes for `app.py`, `deploy.yml`, Docker, requirements, tests, and workflow guardrails, then runs a validation retry loop: project health doctor, Python compile, pytest, Docker build, and container `/health`. If validation fails, it feeds the validation logs back into the next AI attempt. v4 preserves GitHub expressions like `${{ secrets.DOCKERHUB_TOKEN }}`, refuses to write `***MASKED***` placeholders, dynamically discovers the app/container port, and adds a Project Health Guardian workflow to detect broken YAML/policy issues even when the main deploy workflow cannot run. When validation passes, it opens a pull request. A human still reviews/merges the PR. Docker publishing and production deployment are gated by GitHub Environments named `docker-publish` and `production`.
 
 See `docs/AI_AGENT_RUNBOOK.md` for setup details.
 
@@ -79,6 +80,7 @@ Set these under **Settings → Secrets and variables → Actions**:
 - `EC2_SSH_KEY`
 - `GEMINI_API_KEY`
 - `AI_AGENT_API_KEY` (optional but recommended; if omitted, the agent uses `GEMINI_API_KEY`)
+- `AI_AGENT_GITHUB_TOKEN` (classic PAT or fine-grained token that can create PR branches and update workflow files; required when AI remediation changes `.github/workflows/*.yml`)
 
 ## Required GitHub Environments
 
