@@ -58,7 +58,7 @@ jobs:
         run: |
           set -euo pipefail
           docker run -d \
-            -p 5000:5001 \
+            -p 5000:5000 \
             -e GEMINI_API_KEY=dummy-for-healthcheck \
             --name ${{ env.CONTAINER_NAME }}-ci \
             local/${{ env.IMAGE_NAME }}:${{ github.sha }}
@@ -189,7 +189,7 @@ jobs:
 
             echo "Verifying container health..."
             for i in {1..10}; do
-              if curl -fsS http://localhost:50/health; then
+              if curl -fsS http://localhost:5000/health; then
                 echo "Deployment health check passed"
                 docker inspect --format='Deployed image ID: {{.Image}}' "$CONTAINER_NAME"
                 exit 0
