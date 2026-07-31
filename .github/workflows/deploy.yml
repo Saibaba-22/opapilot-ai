@@ -25,7 +25,7 @@ concurrency:
 env:
   IMAGE_NAME: opspilotai
   CONTAINER_NAME: opspilot
-  VM_USERNAME: ubuntu # change this if your Azure VM username is different
+  VM_USERNAME: ubuntu
 
 jobs:
   validate:
@@ -120,7 +120,7 @@ jobs:
           set -euo pipefail
           pytest -q
 
-  detect_clouds:
+  detect-clouds:
     name: Detect available cloud targets
     runs-on: ubuntu-latest
     outputs:
@@ -138,10 +138,10 @@ jobs:
       - name: Detect cloud availability
         id: detect
         env:
-          EC2_HOST: ${{ secrets['EC2_HOST'] }}
-          EC2_SSH_KEY: ${{ secrets['EC2_SSH_KEY'] }}
-          VM_HOST: ${{ secrets['VM_HOST'] }}
-          VM_PASS: ${{ secrets['VM_PASS'] }}
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+          VM_HOST: ${{ secrets.VM_HOST }}
+          VM_PASS: ${{ secrets.VM_PASS }}
           REQUESTED_CLOUD: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.cloud || 'auto' }}
         run: |
           set -euo pipefail
@@ -164,7 +164,7 @@ jobs:
           fi
 
           case "$target" in
-            auto)
+            auto|both)
               request_aws=true
               request_azure=true
               [ "$aws_available" = true ] && deploy_aws=true
@@ -176,12 +176,6 @@ jobs:
               ;;
             azure)
               request_azure=true
-              [ "$azure_available" = true ] && deploy_azure=true
-              ;;
-            both)
-              request_aws=true
-              request_azure=true
-              [ "$aws_available" = true ] && deploy_aws=true
               [ "$azure_available" = true ] && deploy_azure=true
               ;;
             *)
@@ -224,19 +218,19 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
           if [ "${{ steps.detect.outputs.no_cloud_detected }}" = "true" ]; then
-            echo "> No cloud detected." >> "$GITHUB_STEP_SUMMARY"
+            echo "> No cloud detected. Neither AWS nor Azure secrets are configured." >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
 
           if [ "${{ steps.detect.outputs.request_aws }}" = "true" ] && [ "${{ steps.detect.outputs.aws_available }}" != "true" ]; then
-            echo "> AWS not available: EC2_HOST and/or EC2_SSH_KEY missing." >> "$GITHUB_STEP_SUMMARY"
+            echo "> AWS not available: EC2_HOST and/or EC2_SSH_KEY secrets missing." >> "$GITHUB_STEP_SUMMARY"
           fi
 
           if [ "${{ steps.detect.outputs.request_azure }}" = "true" ] && [ "${{ steps.detect.outputs.azure_available }}" != "true" ]; then
-            echo "> Azure not available: VM_HOST and/or VM_PASS missing." >> "$GITHUB_STEP_SUMMARY"
+            echo "> Azure not available: VM_HOST and/or VM_PASS secrets missing." >> "$GITHUB_STEP_SUMMARY"
           fi
 
-  docker_publish:
+  docker-publish:
     name: Publish Docker image after human approval
     runs-on: ubuntu-latest
     needs: [validate, pytest]
@@ -268,27 +262,27 @@ jobs:
             ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
             ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:latest
 
-  deploy_approval:
-    name: Deploy approval
+  deploy:
+    name: Deploy approval gate
     runs-on: ubuntu-latest
-    needs: [docker_publish, detect_clouds]
-    if: needs.detect_clouds.outputs.any_deployable == 'true'
+    needs: [docker-publish, detect-clouds]
+    if: needs.detect-clouds.outputs.any_deployable == 'true'
     timeout-minutes: 10
     environment:
       name: production
 
     steps:
-      - name: Approval note
+      - name: Deployment approved
         run: |
-          echo "Approved deployment"
-          echo "AWS deploy: ${{ needs.detect_clouds.outputs.deploy_aws }}"
-          echo "Azure deploy: ${{ needs.detect_clouds.outputs.deploy_azure }}"
+          echo "Deployment approved"
+          echo "AWS deploy: ${{ needs.detect-clouds.outputs.deploy_aws }}"
+          echo "Azure deploy: ${{ needs.detect-clouds.outputs.deploy_azure }}"
 
-  deploy_aws:
+  deploy-aws:
     name: Deploy to AWS EC2
     runs-on: ubuntu-latest
-    needs: [detect_clouds, deploy_approval]
-    if: needs.detect_clouds.outputs.deploy_aws == 'true' && needs.deploy_approval.result == 'success'
+    needs: [detect-clouds, deploy]
+    if: needs.detect-clouds.outputs.deploy_aws == 'true' && needs.deploy.result == 'success'
     timeout-minutes: 15
 
     steps:
@@ -302,9 +296,9 @@ jobs:
           IMAGE_TAG: ${{ github.sha }}
           CONTAINER_NAME: ${{ env.CONTAINER_NAME }}
         with:
-          host: ${{ secrets['EC2_HOST'] }}
+          host: ${{ secrets.EC2_HOST }}
           username: ubuntu
-          key: ${{ secrets['EC2_SSH_KEY'] }}
+          key: ${{ secrets.EC2_SSH_KEY }}
           envs: DOCKERHUB_USERNAME,DOCKERHUB_TOKEN,GEMINI_API_KEY,IMAGE_NAME,IMAGE_TAG,CONTAINER_NAME
           script_stop: true
           script: |
@@ -344,11 +338,11 @@ jobs:
             docker logs "$CONTAINER_NAME" || true
             exit 1
 
-  deploy_azure:
+  deploy-azure:
     name: Deploy to Azure VM
     runs-on: ubuntu-latest
-    needs: [detect_clouds, deploy_approval]
-    if: needs.detect_clouds.outputs.deploy_azure == 'true' && needs.deploy_approval.result == 'success'
+    needs: [detect-clouds, deploy]
+    if: needs.detect-clouds.outputs.deploy_azure == 'true' && needs.deploy.result == 'success'
     timeout-minutes: 15
 
     steps:
@@ -362,9 +356,9 @@ jobs:
           IMAGE_TAG: ${{ github.sha }}
           CONTAINER_NAME: ${{ env.CONTAINER_NAME }}
         with:
-          host: ${{ secrets['VM_HOST'] }}
+          host: ${{ secrets.VM_HOST }}
           username: ${{ env.VM_USERNAME }}
-          password: ${{ secrets['VM_PASS'] }}
+          password: ${{ secrets.VM_PASS }}
           envs: DOCKERHUB_USERNAME,DOCKERHUB_TOKEN,GEMINI_API_KEY,IMAGE_NAME,IMAGE_TAG,CONTAINER_NAME
           script_stop: true
           script: |
@@ -404,11 +398,11 @@ jobs:
             docker logs "$CONTAINER_NAME" || true
             exit 1
 
-  deployment_summary:
+  deployment-summary:
     name: Deployment summary
     runs-on: ubuntu-latest
     if: always()
-    needs: [detect_clouds, docker_publish, deploy_approval, deploy_aws, deploy_azure]
+    needs: [detect-clouds, docker-publish, deploy, deploy-aws, deploy-azure]
 
     steps:
       - name: Write final summary
@@ -416,25 +410,28 @@ jobs:
           {
             echo "## Deployment Summary"
             echo ""
-            echo "- Trigger: ${{ github.event_name }}"
-            echo "- Requested target: ${{ needs.detect_clouds.outputs.target }}"
-            echo "- AWS available: ${{ needs.detect_clouds.outputs.aws_available }}"
-            echo "- Azure available: ${{ needs.detect_clouds.outputs.azure_available }}"
-            echo "- Docker publish result: ${{ needs.docker_publish.result }}"
-            echo "- AWS deployment result: ${{ needs.deploy_aws.result }}"
-            echo "- Azure deployment result: ${{ needs.deploy_azure.result }}"
+            echo "| Item | Value |"
+            echo "|------|-------|"
+            echo "| Trigger | ${{ github.event_name }} |"
+            echo "| Requested target | ${{ needs.detect-clouds.outputs.target }} |"
+            echo "| AWS available | ${{ needs.detect-clouds.outputs.aws_available }} |"
+            echo "| Azure available | ${{ needs.detect-clouds.outputs.azure_available }} |"
+            echo "| Docker publish | ${{ needs.docker-publish.result }} |"
+            echo "| Deploy gate | ${{ needs.deploy.result }} |"
+            echo "| AWS deploy | ${{ needs.deploy-aws.result }} |"
+            echo "| Azure deploy | ${{ needs.deploy-azure.result }} |"
             echo ""
           } >> "$GITHUB_STEP_SUMMARY"
 
-          if [ "${{ needs.detect_clouds.outputs.no_cloud_detected }}" = "true" ]; then
-            echo "> No cloud detected. Neither AWS nor Azure secrets are available." >> "$GITHUB_STEP_SUMMARY"
+          if [ "${{ needs.detect-clouds.outputs.no_cloud_detected }}" = "true" ]; then
+            echo "> **No cloud detected.** Neither AWS nor Azure secrets are configured." >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
 
-          if [ "${{ needs.detect_clouds.outputs.request_aws }}" = "true" ] && [ "${{ needs.detect_clouds.outputs.aws_available }}" != "true" ]; then
-            echo "> AWS not available: set EC2_HOST and EC2_SSH_KEY." >> "$GITHUB_STEP_SUMMARY"
+          if [ "${{ needs.detect-clouds.outputs.request_aws }}" = "true" ] && [ "${{ needs.detect-clouds.outputs.aws_available }}" != "true" ]; then
+            echo "> **AWS not available:** Add EC2_HOST and EC2_SSH_KEY secrets." >> "$GITHUB_STEP_SUMMARY"
           fi
 
-          if [ "${{ needs.detect_clouds.outputs.request_azure }}" = "true" ] && [ "${{ needs.detect_clouds.outputs.azure_available }}" != "true" ]; then
-            echo "> Azure not available: set VM_HOST and VM_PASS." >> "$GITHUB_STEP_SUMMARY"
+          if [ "${{ needs.detect-clouds.outputs.request_azure }}" = "true" ] && [ "${{ needs.detect-clouds.outputs.azure_available }}" != "true" ]; then
+            echo "> **Azure not available:** Add VM_HOST and VM_PASS secrets." >> "$GITHUB_STEP_SUMMARY"
           fi
