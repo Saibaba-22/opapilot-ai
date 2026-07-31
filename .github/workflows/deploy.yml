@@ -4,6 +4,16 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      cloud:
+        description: "Choose deployment target"
+        required: true
+        type: choice
+        default: both
+        options:
+          - aws
+          - azure
+          - both
 
 permissions:
   contents: read
@@ -15,6 +25,7 @@ concurrency:
 env:
   IMAGE_NAME: opspilotai
   CONTAINER_NAME: opspilot
+  VM_USERNAME: ubuntu # change this if your Azure VM username is different
 
 jobs:
   validate:
@@ -29,7 +40,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
           cache: pip
 
       - name: Install Python dependencies
@@ -92,7 +103,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
           cache: pip
           cache-dependency-path: |
             requirements.txt
@@ -109,7 +120,123 @@ jobs:
           set -euo pipefail
           pytest -q
 
-  docker-publish:
+  detect_clouds:
+    name: Detect available cloud targets
+    runs-on: ubuntu-latest
+    outputs:
+      target: ${{ steps.detect.outputs.target }}
+      aws_available: ${{ steps.detect.outputs.aws_available }}
+      azure_available: ${{ steps.detect.outputs.azure_available }}
+      request_aws: ${{ steps.detect.outputs.request_aws }}
+      request_azure: ${{ steps.detect.outputs.request_azure }}
+      deploy_aws: ${{ steps.detect.outputs.deploy_aws }}
+      deploy_azure: ${{ steps.detect.outputs.deploy_azure }}
+      any_deployable: ${{ steps.detect.outputs.any_deployable }}
+      no_cloud_detected: ${{ steps.detect.outputs.no_cloud_detected }}
+
+    steps:
+      - name: Detect cloud availability
+        id: detect
+        env:
+          EC2_HOST: ${{ secrets['EC2_HOST'] }}
+          EC2_SSH_KEY: ${{ secrets['EC2_SSH_KEY'] }}
+          VM_HOST: ${{ secrets['VM_HOST'] }}
+          VM_PASS: ${{ secrets['VM_PASS'] }}
+          REQUESTED_CLOUD: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.cloud || 'auto' }}
+        run: |
+          set -euo pipefail
+
+          target="${REQUESTED_CLOUD:-auto}"
+
+          aws_available=false
+          azure_available=false
+          request_aws=false
+          request_azure=false
+          deploy_aws=false
+          deploy_azure=false
+
+          if [ -n "${EC2_HOST}" ] && [ -n "${EC2_SSH_KEY}" ]; then
+            aws_available=true
+          fi
+
+          if [ -n "${VM_HOST}" ] && [ -n "${VM_PASS}" ]; then
+            azure_available=true
+          fi
+
+          case "$target" in
+            auto)
+              request_aws=true
+              request_azure=true
+              [ "$aws_available" = true ] && deploy_aws=true
+              [ "$azure_available" = true ] && deploy_azure=true
+              ;;
+            aws)
+              request_aws=true
+              [ "$aws_available" = true ] && deploy_aws=true
+              ;;
+            azure)
+              request_azure=true
+              [ "$azure_available" = true ] && deploy_azure=true
+              ;;
+            both)
+              request_aws=true
+              request_azure=true
+              [ "$aws_available" = true ] && deploy_aws=true
+              [ "$azure_available" = true ] && deploy_azure=true
+              ;;
+            *)
+              echo "Unsupported cloud input: $target"
+              exit 1
+              ;;
+          esac
+
+          any_deployable=false
+          if [ "$deploy_aws" = true ] || [ "$deploy_azure" = true ]; then
+            any_deployable=true
+          fi
+
+          no_cloud_detected=false
+          if [ "$aws_available" = false ] && [ "$azure_available" = false ]; then
+            no_cloud_detected=true
+          fi
+
+          {
+            echo "target=$target"
+            echo "aws_available=$aws_available"
+            echo "azure_available=$azure_available"
+            echo "request_aws=$request_aws"
+            echo "request_azure=$request_azure"
+            echo "deploy_aws=$deploy_aws"
+            echo "deploy_azure=$deploy_azure"
+            echo "any_deployable=$any_deployable"
+            echo "no_cloud_detected=$no_cloud_detected"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Write cloud detection note
+        run: |
+          {
+            echo "## Cloud Detection"
+            echo ""
+            echo "- Requested target: ${{ steps.detect.outputs.target }}"
+            echo "- AWS available: ${{ steps.detect.outputs.aws_available }}"
+            echo "- Azure available: ${{ steps.detect.outputs.azure_available }}"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "${{ steps.detect.outputs.no_cloud_detected }}" = "true" ]; then
+            echo "> No cloud detected." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          if [ "${{ steps.detect.outputs.request_aws }}" = "true" ] && [ "${{ steps.detect.outputs.aws_available }}" != "true" ]; then
+            echo "> AWS not available: EC2_HOST and/or EC2_SSH_KEY missing." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          if [ "${{ steps.detect.outputs.request_azure }}" = "true" ] && [ "${{ steps.detect.outputs.azure_available }}" != "true" ]; then
+            echo "> Azure not available: VM_HOST and/or VM_PASS missing." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  docker_publish:
     name: Publish Docker image after human approval
     runs-on: ubuntu-latest
     needs: [validate, pytest]
@@ -141,13 +268,28 @@ jobs:
             ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
             ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:latest
 
-  deploy:
-    name: Deploy to EC2 after human approval
+  deploy_approval:
+    name: Deploy approval
     runs-on: ubuntu-latest
-    needs: docker-publish
-    timeout-minutes: 15
+    needs: [docker_publish, detect_clouds]
+    if: needs.detect_clouds.outputs.any_deployable == 'true'
+    timeout-minutes: 10
     environment:
       name: production
+
+    steps:
+      - name: Approval note
+        run: |
+          echo "Approved deployment"
+          echo "AWS deploy: ${{ needs.detect_clouds.outputs.deploy_aws }}"
+          echo "Azure deploy: ${{ needs.detect_clouds.outputs.deploy_azure }}"
+
+  deploy_aws:
+    name: Deploy to AWS EC2
+    runs-on: ubuntu-latest
+    needs: [detect_clouds, deploy_approval]
+    if: needs.detect_clouds.outputs.deploy_aws == 'true' && needs.deploy_approval.result == 'success'
+    timeout-minutes: 15
 
     steps:
       - name: Deploy immutable image tag to AWS EC2
@@ -160,16 +302,16 @@ jobs:
           IMAGE_TAG: ${{ github.sha }}
           CONTAINER_NAME: ${{ env.CONTAINER_NAME }}
         with:
-          host: ${{ secrets.EC2_HOST }}
+          host: ${{ secrets['EC2_HOST'] }}
           username: ubuntu
-          key: ${{ secrets.EC2_SSH_KEY }}
+          key: ${{ secrets['EC2_SSH_KEY'] }}
           envs: DOCKERHUB_USERNAME,DOCKERHUB_TOKEN,GEMINI_API_KEY,IMAGE_NAME,IMAGE_TAG,CONTAINER_NAME
           script_stop: true
           script: |
             set -Eeuo pipefail
 
             IMAGE="$DOCKERHUB_USERNAME/$IMAGE_NAME:$IMAGE_TAG"
-            echo "Deploying image: $IMAGE"
+            echo "Deploying image to AWS: $IMAGE"
 
             echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
 
@@ -190,7 +332,7 @@ jobs:
             echo "Verifying container health..."
             for i in {1..10}; do
               if curl -fsS http://localhost:5000/health; then
-                echo "Deployment health check passed"
+                echo "AWS deployment health check passed"
                 docker inspect --format='Deployed image ID: {{.Image}}' "$CONTAINER_NAME"
                 exit 0
               fi
@@ -198,6 +340,101 @@ jobs:
               sleep 3
             done
 
-            echo "Deployment health check failed"
+            echo "AWS deployment health check failed"
             docker logs "$CONTAINER_NAME" || true
             exit 1
+
+  deploy_azure:
+    name: Deploy to Azure VM
+    runs-on: ubuntu-latest
+    needs: [detect_clouds, deploy_approval]
+    if: needs.detect_clouds.outputs.deploy_azure == 'true' && needs.deploy_approval.result == 'success'
+    timeout-minutes: 15
+
+    steps:
+      - name: Deploy immutable image tag to Azure VM
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+          IMAGE_TAG: ${{ github.sha }}
+          CONTAINER_NAME: ${{ env.CONTAINER_NAME }}
+        with:
+          host: ${{ secrets['VM_HOST'] }}
+          username: ${{ env.VM_USERNAME }}
+          password: ${{ secrets['VM_PASS'] }}
+          envs: DOCKERHUB_USERNAME,DOCKERHUB_TOKEN,GEMINI_API_KEY,IMAGE_NAME,IMAGE_TAG,CONTAINER_NAME
+          script_stop: true
+          script: |
+            set -Eeuo pipefail
+
+            IMAGE="$DOCKERHUB_USERNAME/$IMAGE_NAME:$IMAGE_TAG"
+            echo "Deploying image to Azure: $IMAGE"
+
+            echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
+
+            echo "Pulling image..."
+            docker pull "$IMAGE"
+
+            echo "Replacing old container if it exists..."
+            docker rm -f "$CONTAINER_NAME" || true
+
+            echo "Starting new container..."
+            docker run -d \
+              -p 5000:5000 \
+              -e GEMINI_API_KEY="$GEMINI_API_KEY" \
+              --name "$CONTAINER_NAME" \
+              --restart unless-stopped \
+              "$IMAGE"
+
+            echo "Verifying container health..."
+            for i in {1..10}; do
+              if curl -fsS http://localhost:5000/health; then
+                echo "Azure deployment health check passed"
+                docker inspect --format='Deployed image ID: {{.Image}}' "$CONTAINER_NAME"
+                exit 0
+              fi
+              docker logs --tail=50 "$CONTAINER_NAME" || true
+              sleep 3
+            done
+
+            echo "Azure deployment health check failed"
+            docker logs "$CONTAINER_NAME" || true
+            exit 1
+
+  deployment_summary:
+    name: Deployment summary
+    runs-on: ubuntu-latest
+    if: always()
+    needs: [detect_clouds, docker_publish, deploy_approval, deploy_aws, deploy_azure]
+
+    steps:
+      - name: Write final summary
+        run: |
+          {
+            echo "## Deployment Summary"
+            echo ""
+            echo "- Trigger: ${{ github.event_name }}"
+            echo "- Requested target: ${{ needs.detect_clouds.outputs.target }}"
+            echo "- AWS available: ${{ needs.detect_clouds.outputs.aws_available }}"
+            echo "- Azure available: ${{ needs.detect_clouds.outputs.azure_available }}"
+            echo "- Docker publish result: ${{ needs.docker_publish.result }}"
+            echo "- AWS deployment result: ${{ needs.deploy_aws.result }}"
+            echo "- Azure deployment result: ${{ needs.deploy_azure.result }}"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "${{ needs.detect_clouds.outputs.no_cloud_detected }}" = "true" ]; then
+            echo "> No cloud detected. Neither AWS nor Azure secrets are available." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          if [ "${{ needs.detect_clouds.outputs.request_aws }}" = "true" ] && [ "${{ needs.detect_clouds.outputs.aws_available }}" != "true" ]; then
+            echo "> AWS not available: set EC2_HOST and EC2_SSH_KEY." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          if [ "${{ needs.detect_clouds.outputs.request_azure }}" = "true" ] && [ "${{ needs.detect_clouds.outputs.azure_available }}" != "true" ]; then
+            echo "> Azure not available: set VM_HOST and VM_PASS." >> "$GITHUB_STEP_SUMMARY"
+          fi
