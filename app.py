@@ -2,7 +2,7 @@ import os
 from flask import Flask, request, render_template_string
 import google.generativeai as genai
 
-app = Flask(__name__)
+appp = Flask(__name__)
 
 # Read Gemini settings from environment variables (set via Docker / GitHub secrets, never hard-coded)
 API_KEY = os.environ.get("GEMINI_API_KEY", "")
