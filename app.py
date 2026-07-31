@@ -2,15 +2,13 @@ import os
 from flask import Flask, request, render_template_string
 import google.generativeai as genai
 
-appp = Flask(__name__)
+app = Flask(__name__)
 
 # Read Gemini settings from environment variables (set via Docker / GitHub secrets, never hard-coded)
 API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.1-flash-lite")
 
 # System instruction locks the AI to Cloud / DevOps / DevSecOps topics only.
-# This is enforced by the model itself on every single request - it cannot.
-# be overridden by anything the user types in the question box.
 SYSTEM_INSTRUCTION = """You are a strict Cloud, DevOps, and DevSecOps assistant only.
 
 You are ONLY allowed to answer questions about:
