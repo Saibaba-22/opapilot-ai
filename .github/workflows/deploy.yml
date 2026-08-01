@@ -25,7 +25,6 @@ concurrency:
 env:
   IMAGE_NAME: opspilotai
   CONTAINER_NAME: opspilot
-  VM_USERNAME: ordinary
 
 jobs:
   validate:
@@ -140,8 +139,10 @@ jobs:
         env:
           EC2_HOST: ${{ secrets.EC2_HOST }}
           EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+          EC2_USER: ${{ secrets.EC2_USER }}
           VM_HOST: ${{ secrets.VM_HOST }}
-          VM_PASS: ${{ secrets.VM_PASS }}
+          VM_KEY: ${{ secrets.VM_KEY }}
+          VM_USER: ${{ secrets.VM_USER }}
           REQUESTED_CLOUD: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.cloud || 'auto' }}
         run: |
           set -euo pipefail
@@ -155,11 +156,11 @@ jobs:
           deploy_aws=false
           deploy_azure=false
 
-          if [ -n "${EC2_HOST}" ] && [ -n "${EC2_SSH_KEY}" ]; then
+          if [ -n "${EC2_HOST}" ] && [ -n "${EC2_SSH_KEY}" ] && [ -n "${EC2_USER}" ]; then
             aws_available=true
           fi
 
-          if [ -n "${VM_HOST}" ] && [ -n "${VM_PASS}" ]; then
+          if [ -n "${VM_HOST}" ] && [ -n "${VM_KEY}" ] && [ -n "${VM_USER}" ]; then
             azure_available=true
           fi
 
@@ -223,11 +224,11 @@ jobs:
           fi
 
           if [ "${{ steps.detect.outputs.request_aws }}" = "true" ] && [ "${{ steps.detect.outputs.aws_available }}" != "true" ]; then
-            echo "> AWS not available: EC2_HOST and/or EC2_SSH_KEY secrets missing." >> "$GITHUB_STEP_SUMMARY"
+            echo "> AWS not available: EC2_HOST, EC2_SSH_KEY and/or EC2_USER secrets missing." >> "$GITHUB_STEP_SUMMARY"
           fi
 
           if [ "${{ steps.detect.outputs.request_azure }}" = "true" ] && [ "${{ steps.detect.outputs.azure_available }}" != "true" ]; then
-            echo "> Azure not available: VM_HOST and/or VM_PASS secrets missing." >> "$GITHUB_STEP_SUMMARY"
+            echo "> Azure not available: VM_HOST, VM_KEY and/or VM_USER secrets missing." >> "$GITHUB_STEP_SUMMARY"
           fi
 
   docker-publish:
@@ -297,7 +298,7 @@ jobs:
           CONTAINER_NAME: ${{ env.CONTAINER_NAME }}
         with:
           host: ${{ secrets.EC2_HOST }}
-          username: ubuntu
+          username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_SSH_KEY }}
           envs: DOCKERHUB_USERNAME,DOCKERHUB_TOKEN,GEMINI_API_KEY,IMAGE_NAME,IMAGE_TAG,CONTAINER_NAME
           script_stop: true
@@ -357,8 +358,8 @@ jobs:
           CONTAINER_NAME: ${{ env.CONTAINER_NAME }}
         with:
           host: ${{ secrets.VM_HOST }}
-          username: ${{ env.VM_USERNAME }}
-          password: ${{ secrets.VM_PASS }}
+          username: ${{ secrets.VM_USER }}
+          password: ${{ secrets.VM_KEY }}
           envs: DOCKERHUB_USERNAME,DOCKERHUB_TOKEN,GEMINI_API_KEY,IMAGE_NAME,IMAGE_TAG,CONTAINER_NAME
           script_stop: true
           script: |
@@ -429,9 +430,9 @@ jobs:
           fi
 
           if [ "${{ needs.detect-clouds.outputs.request_aws }}" = "true" ] && [ "${{ needs.detect-clouds.outputs.aws_available }}" != "true" ]; then
-            echo "> **AWS not available:** Add EC2_HOST and EC2_SSH_KEY secrets." >> "$GITHUB_STEP_SUMMARY"
+            echo "> **AWS not available:** Add EC2_HOST, EC2_SSH_KEY and EC2_USER secrets." >> "$GITHUB_STEP_SUMMARY"
           fi
 
           if [ "${{ needs.detect-clouds.outputs.request_azure }}" = "true" ] && [ "${{ needs.detect-clouds.outputs.azure_available }}" != "true" ]; then
-            echo "> **Azure not available:** Add VM_HOST and VM_PASS secrets." >> "$GITHUB_STEP_SUMMARY"
+            echo "> **Azure not available:** Add VM_HOST, VM_KEY and VM_USER secrets." >> "$GITHUB_STEP_SUMMARY"
           fi
